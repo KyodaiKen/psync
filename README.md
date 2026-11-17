@@ -1,8 +1,14 @@
 # psync
 
-`rsync`, but with **parallel transfer**, **live progress bars**, and
-**pybackupsync-compatible YAML config files** — written in Rust, with
+`rsync`, but **local-only** — with **parallel transfer**, **live progress
+bars**, and **YAML config files** — written in Rust, with
 `#![forbid(unsafe_code)]`.
+
+> **Local-only by design:** psync syncs between paths on this machine
+> (disks, local or NAS mounts). It does not speak the rsync remote/daemon
+> protocol and rejects `user@host::` specs. Need a remote hop? Mount it
+> (NFS/SMB/SSHFS) and sync locally, or use plain rsync for that jump —
+> see the compatibility notes below.
 
 ```
 $ psync -av --stats -j 4 src/ dst/
