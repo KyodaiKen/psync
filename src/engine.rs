@@ -228,7 +228,7 @@ fn execute(job: &Job, ctx: &EngineCtx) -> JobOutcome {
 }
 
 fn run_file(
-    task_id: usize,
+    _task_id: usize,
     rel: &str,
     src: &Path,
     dst: &Path,
@@ -244,8 +244,6 @@ fn run_file(
     temp_dir: Option<&Path>,
     ctx: &EngineCtx,
 ) -> JobOutcome {
-    let task = &ctx.tasks[task_id];
-
     if cancel::is_cancelled() {
         return JobOutcome::Cancelled;
     }
@@ -259,8 +257,7 @@ fn run_file(
             let _ = fs::remove_file(dst);
             match fs::hard_link(link_src, dst) {
                 Ok(()) => {
-                    task.inc_bytes(size);
-                    task.finish_file();
+                    ctx.ui.skip_bytes(size);
                     return JobOutcome::Linked {
                         bytes: size,
                         link_dest: true,
@@ -287,8 +284,7 @@ fn run_file(
             }
         };
         if a == b {
-            task.inc_bytes(size);
-            task.finish_file();
+            ctx.ui.skip_bytes(size);
             return JobOutcome::Skipped {
                 reason: "checksums identical".into(),
             };
@@ -356,16 +352,14 @@ fn run_file(
     };
     let copy_target = staged.as_deref().unwrap_or(dst);
 
-    task.set_current_file(rel);
-
-    let last_done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let hook_task = task.clone();
-    let on_chunk: fsutil::ChunkHook = Box::new(move |done: u64| {
-        let prev = last_done.swap(done, std::sync::atomic::Ordering::Relaxed);
-        let delta = done.wrapping_sub(prev);
-        hook_task.inc_bytes(delta);
-        true
-    });
+    let fbar = ctx.ui.begin_file(rel, size);
+    let on_chunk: fsutil::ChunkHook = {
+        let fbar = fbar.clone();
+        Box::new(move |done: u64| {
+            fbar.report(done);
+            true
+        })
+    };
 
     let copy_ctx = CopyCtx {
         preserve_perms,
@@ -411,12 +405,15 @@ fn run_file(
                 }
             }
             ctx.record_transferred(dst.to_path_buf());
-            task.finish_file();
+            fbar.finish(Some(done));
             JobOutcome::Copied { bytes: done }
         }
-        Err(AppError::Cancelled) => JobOutcome::Cancelled,
+        Err(AppError::Cancelled) => {
+            fbar.finish(None);
+            JobOutcome::Cancelled
+        }
         Err(e) => {
-            task.count_error();
+            fbar.finish(None);
             JobOutcome::Error(JobError {
                 rel: rel.to_string(),
                 error: e,
@@ -425,7 +422,7 @@ fn run_file(
     }
 }
 
-fn run_link(task_id: usize, rel: &str, dst: &Path, target: &str, ctx: &EngineCtx) -> JobOutcome {
+fn run_link(_task_id: usize, rel: &str, dst: &Path, target: &str, ctx: &EngineCtx) -> JobOutcome {
     if ctx.dry_run {
         return JobOutcome::DryRun { bytes: 0 };
     }
@@ -440,7 +437,6 @@ fn run_link(task_id: usize, rel: &str, dst: &Path, target: &str, ctx: &EngineCtx
     match fs::read_link(dst) {
         Ok(existing) => {
             if existing.to_string_lossy() == target {
-                ctx.tasks[task_id].finish_file();
                 return JobOutcome::Skipped {
                     reason: "symlink already correct".into(),
                 };
@@ -455,15 +451,11 @@ fn run_link(task_id: usize, rel: &str, dst: &Path, target: &str, ctx: &EngineCtx
         }
     }
     match std::os::unix::fs::symlink(target, dst) {
-        Ok(()) => {
-            ctx.tasks[task_id].finish_file();
-            JobOutcome::Linked {
-                bytes: 0,
-                link_dest: false,
-            }
-        }
+        Ok(()) => JobOutcome::Linked {
+            bytes: 0,
+            link_dest: false,
+        },
         Err(e) => {
-            ctx.tasks[task_id].count_error();
             JobOutcome::Error(JobError {
                 rel: rel.to_string(),
                 error: AppError::io(format!("creating symlink '{}'", dst.display()), e),
@@ -473,7 +465,7 @@ fn run_link(task_id: usize, rel: &str, dst: &Path, target: &str, ctx: &EngineCtx
 }
 
 fn run_node(
-    task_id: usize,
+    _task_id: usize,
     rel: &str,
     dst: &Path,
     kind: &crate::plan::NodeKind,
@@ -511,12 +503,10 @@ fn run_node(
     match out {
         Ok(o) if o.status.success() => {
             let _ = fsutil::set_mode(dst, perm);
-            ctx.tasks[task_id].finish_file();
             JobOutcome::Linked { bytes: 0, link_dest: false }
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            ctx.tasks[task_id].count_error();
             JobOutcome::Error(JobError {
                 rel: rel.to_string(),
                 error: AppError::Other(format!(
@@ -525,7 +515,6 @@ fn run_node(
             })
         }
         Err(e) => {
-            ctx.tasks[task_id].count_error();
             JobOutcome::Error(JobError {
                 rel: rel.to_string(),
                 error: AppError::io(format!("running node-creation tool for '{}'", dst.display()), e),

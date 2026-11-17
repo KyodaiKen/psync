@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::cancel;
 use crate::config::DeletionPolicy;
 use crate::error::Result;
-use crate::fsutil::format_bytes;
+use crate::fsutil::{format_bytes, Units};
 use crate::mount;
 
 #[derive(Debug, Clone)]
@@ -107,6 +107,7 @@ pub fn ensure_space(
     policy: DeletionPolicy,
     exclude_patterns: &[String],
     dry_run: bool,
+    units: Units,
 ) -> Result<()> {
     if needed_bytes <= 0 {
         return Ok(());
@@ -128,7 +129,7 @@ pub fn ensure_space(
     eprintln!(
         "Cleaning up (Policy: {}). Need {} more.",
         policy_name(policy),
-        format_bytes(deficit)
+        format_bytes(deficit, units)
     );
 
     let candidates = collect_candidates(target_dirs, exclude_patterns);
@@ -207,7 +208,7 @@ pub fn ensure_space(
                 eprintln!(
                     "Monthly duplicates cleaned. Still need {} more. \
                      Starting monthly archive deletion.",
-                    format_bytes(needed - remaining_free)
+                    format_bytes(needed - remaining_free, units)
                 );
                 stage2_done = true;
             }
@@ -229,7 +230,7 @@ pub fn ensure_space(
     }
 
     if remaining_free >= needed {
-        eprintln!("Freed enough space ({}).", format_bytes(deleted_size));
+        eprintln!("Freed enough space ({}).", format_bytes(deleted_size, units));
     } else {
         eprintln!("Warning: Cleanup finished but might still lack space.");
     }

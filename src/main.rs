@@ -161,7 +161,12 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
         }
     }
 
-    let mut ui = progress::ProgressUi::new();
+    let units = if cli.si_units {
+        fsutil::Units::Si
+    } else {
+        fsutil::Units::Jedec
+    };
+    let ui = progress::ProgressUi::new(units);
     let spin = ui.spinner("scan", "scanning source…");
 
     let scan_opts = plan::ScanOpts {
@@ -178,7 +183,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     };
 
     let mut plan = plan::scan_sources(&specs, &scan_opts)?;
-    drop(spin);
+    spin.finish_and_clear();
 
     let decide = plan::DecideOpts {
         checksum: cli.checksum,
@@ -292,7 +297,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     if dry || cli.list_only {
         let fmt = cli.out_format.as_deref();
         for l in &itemize {
-            println!("{}", l.render(fmt, cli.human));
+            println!("{}", l.render(fmt, cli.human, units));
         }
         let to_copy = plan
             .files
@@ -302,11 +307,11 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
         println!("Number of files to be transferred: {to_copy}");
         println!(
             "Total size to be transferred: {}",
-            fsutil::format_bytes(plan.total_copy_bytes)
+            fsutil::format_bytes(plan.total_copy_bytes, units)
         );
         println!("Number of files skipped: {}", plan.skipped);
         if cli.stats {
-            print!("{}", dry_summary(&plan, cli.human).render());
+            print!("{}", dry_summary(&plan, cli.human, units).render());
         }
         if let Some(logf) = &cli.log_file {
             if let Err(e) = report::write_log_file(logf, &itemize) {
@@ -340,22 +345,16 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
         }
     }
 
-    // Progress task + engine context.
-    let to_copy_n = plan
-        .files
-        .iter()
-        .filter(|f| !matches!(f.action, plan::FileAction::Skip(_)))
-        .count();
-    let job_count = to_copy_n as u64 + plan.links.len() as u64 + plan.nodes.len() as u64;
-    let task = ui.add_task(
-        &dst.to_string_lossy().into_owned(),
-        plan.total_copy_bytes,
-        job_count,
-    );
+    // Grand total bar (one bar per active file is opened by the workers
+    // as they go). Skipped when nothing will be copied — no stray bar.
+    if plan.total_copy_bytes > 0 {
+        ui.begin_total("total", plan.total_copy_bytes);
+    }
 
     let pacer = cli.bwlimit_kib().map(|k| Mutex::new(fsutil::Pacer::new(k)));
     let ctx = Arc::new(EngineCtx::new(
-        vec![task.clone()],
+        ui.clone(),
+        vec![dst.to_string_lossy().into_owned()],
         pacer,
         false,
         cli.suffix.clone().unwrap_or_else(|| "~".into()),
@@ -365,7 +364,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     if cli.delete || cli.delete_before || cli.delete_during {
         let spin = ui.spinner("del", "deleting extraneous files…");
         execute_deletes(&delete_plan, &ctx);
-        drop(spin);
+        spin.finish_and_clear();
     }
 
     // Build the job list.
@@ -431,10 +430,10 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     if cli.delete_after {
         let spin = ui.spinner("del", "deleting extraneous files…");
         execute_deletes(&delete_plan, &ctx);
-        drop(spin);
+        spin.finish_and_clear();
     }
 
-    Ok(final_report(cli, &ctx, &plan, &itemize, &mut ui))
+    Ok(final_report(cli, &ctx, &plan, &itemize, &ui))
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +517,12 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
         hard_links: false,
     };
 
-    let mut ui = progress::ProgressUi::new();
+    let units = if cli.si_units {
+        fsutil::Units::Si
+    } else {
+        fsutil::Units::Jedec
+    };
+    let ui = progress::ProgressUi::new(units);
     let spin = ui.spinner("scan", &format!("scanning {}", src_root.display()));
     let base_plan = plan::scan_sources(
         &[plan::SourceSpec {
@@ -527,7 +531,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
         }],
         &scan_opts,
     )?;
-    drop(spin);
+    spin.finish_and_clear();
 
     if base_plan.files.is_empty() && base_plan.links.is_empty() && base_plan.nodes.is_empty()
     {
@@ -612,7 +616,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             eprintln!(
                 "  would copy {} files ({} new data)",
                 to_copy.len(),
-                fsutil::format_bytes(p.total_copy_bytes)
+                fsutil::format_bytes(p.total_copy_bytes, units)
             );
             if needed > 0 && !dry {
                 if d.deletion_exclude_patterns.iter().any(|x| x.trim() == "*") {
@@ -632,6 +636,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
                         d.deletion_policy,
                         &d.deletion_exclude_patterns,
                         dry,
+                        units,
                     )?;
                 }
             }
@@ -756,7 +761,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
                 dp.dst_root.display()
             );
         }
-        eprintln!("Total data to copy: {}", fsutil::format_bytes(total_new_bytes));
+        eprintln!("Total data to copy: {}", fsutil::format_bytes(total_new_bytes, units));
         return Ok(0);
     }
 
@@ -764,23 +769,20 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
         eprintln!("All destinations are up to date; nothing to copy.");
     }
 
-    // ---- progress: one bar per destination (full task progress), + total
-    let mut tasks: Vec<progress::TaskBar> = Vec::new();
-    for (di, dp) in dests.iter().enumerate() {
-        let n_jobs = jobs.iter().filter(|j| j.task_id() == di).count() as u64;
-        tasks.push(ui.add_task(&dp.label, dp.plan.total_copy_bytes, n_jobs));
-    }
-    if dests.len() > 1 {
-        ui.add_total("total", total_new_bytes);
+    // ---- progress: one bar per active file (workers open them as they
+    // go) + one grand total bar
+    if total_new_bytes > 0 {
+        ui.begin_total("total", total_new_bytes);
     }
 
     // ---- engine
     let pacer = cli.bwlimit_kib().map(|k| Mutex::new(fsutil::Pacer::new(k)));
-    let ctx = Arc::new(EngineCtx::new(tasks, pacer, false, "~".into()));
+    let labels: Vec<String> = dests.iter().map(|d| d.label.clone()).collect();
+    let ctx = Arc::new(EngineCtx::new(ui.clone(), labels, pacer, false, "~".into()));
 
     eprintln!(
         "Starting Copy. Total data: {}",
-        fsutil::format_bytes(total_new_bytes)
+        fsutil::format_bytes(total_new_bytes, units)
     );
 
     let n_workers = cli.jobs.unwrap_or(cfg.max_parallel_processes);
@@ -821,6 +823,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             cancelled_jobs: ctx.cancelled_jobs.load(Ordering::Relaxed),
             elapsed_secs: ctx.started.elapsed().as_secs_f64(),
             human: cli.human,
+            units,
         };
         print!("{}", s.render());
     }
@@ -1116,7 +1119,7 @@ fn itemize_flags(cli: &Cli) -> String {
 }
 
 /// `--stats` summary for a finished (or dry) run.
-fn dry_summary(plan: &plan::Plan, human: bool) -> report::Summary {
+fn dry_summary(plan: &plan::Plan, human: bool, units: fsutil::Units) -> report::Summary {
     let to_copy = plan
         .files
         .iter()
@@ -1136,6 +1139,7 @@ fn dry_summary(plan: &plan::Plan, human: bool) -> report::Summary {
         cancelled_jobs: 0,
         elapsed_secs: 0.0,
         human,
+        units,
     }
 }
 
@@ -1145,7 +1149,7 @@ fn final_report(
     ctx: &EngineCtx,
     plan: &plan::Plan,
     itemize: &[report::ItemizeLine],
-    ui: &mut progress::ProgressUi,
+    ui: &progress::ProgressUi,
 ) -> i32 {
     ui.finish_all();
 
@@ -1160,7 +1164,7 @@ fn final_report(
     if cli.itemize || cli.verbose > 0 {
         let fmt = cli.out_format.as_deref();
         for l in itemize {
-            println!("{}", l.render(fmt, cli.human));
+            println!("{}", l.render(fmt, cli.human, ui.units()));
         }
     }
 
@@ -1179,6 +1183,7 @@ fn final_report(
             cancelled_jobs: ctx.cancelled_jobs.load(Ordering::Relaxed),
             elapsed_secs: ctx.started.elapsed().as_secs_f64(),
             human: cli.human,
+            units: ui.units(),
         };
         print!("{}", s.render());
     }

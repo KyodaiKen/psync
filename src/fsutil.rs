@@ -84,12 +84,33 @@ pub fn parse_size(input: &str) -> Result<u64> {
 }
 
 /// Format a byte count like `12.3 GB` (JEDEC units, like the Python original).
-pub fn format_bytes(n: u64) -> String {
+/// Byte-unit convention for human-readable output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Units {
+    /// Default: the old "KB" = 1024 B (JEDEC-style labels).
+    Jedec,
+    /// Strict SI: 1 KB = 1000 B (the masochists' choice, `--si-units`).
+    Si,
+}
+
+impl Units {
+    fn base(self) -> f64 {
+        match self {
+            Units::Jedec => 1024.0,
+            Units::Si => 1000.0,
+        }
+    }
+}
+
+/// Human-readable byte count with the chosen convention:
+/// `B`, `KB`, `MB`, `GB`, `TB` over a 1024- (default) or 1000-base.
+pub fn format_bytes(n: u64, units: Units) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let base = units.base();
     let mut v = n as f64;
     let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
+    while v >= base && i < UNITS.len() - 1 {
+        v /= base;
         i += 1;
     }
     if i == 0 {
@@ -97,6 +118,11 @@ pub fn format_bytes(n: u64) -> String {
     } else {
         format!("{v:.1} {}", UNITS[i])
     }
+}
+
+/// Human-readable transfer speed (bytes per second).
+pub fn format_speed(bytes_per_sec: f64, units: Units) -> String {
+    format!("{}/s", format_bytes(bytes_per_sec as u64, units))
 }
 
 /// Compact duration like `0d00h00m05s` (pybackupsync `format_time`).

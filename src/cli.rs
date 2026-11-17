@@ -114,6 +114,11 @@ pub struct Cli {
     /// Human-readable numbers in the stats output.
     #[arg(short = 'h', help = "human-readable sizes in the stats output")]
     pub human: bool,
+
+    /// Use strict SI units (1 KB = 1000 B) instead of the default
+    /// JEDEC-style convention (1 KB = 1024 B) in progress bars and stats.
+    #[arg(long = "si-units", help = "use strict SI units (kB=1000 B) instead of KB=1024 B")]
+    pub si_units: bool,
     /// Keep partially transferred files.
     #[arg(short = 'P', long = "partial")]
     pub partial: bool,

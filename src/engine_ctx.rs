@@ -6,14 +6,14 @@
 //! mistakes.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use std::path::PathBuf;
 
 use crate::error::AppError;
 use crate::fsutil::Pacer;
-use crate::progress::TaskBar;
+use crate::progress::ProgressUi;
 
 /// Error for a single job (file), kept for the final report.
 #[derive(Debug)]
@@ -54,8 +54,10 @@ pub enum JobOutcome {
 
 /// Context shared by all workers of one run.
 pub struct EngineCtx {
-    /// One task bar per parallel copy task (destination).
-    pub tasks: Vec<TaskBar>,
+    /// The shared progress UI (per-file bars + total bar).
+    pub ui: Arc<ProgressUi>,
+    /// One label per destination (for reporting/debugging).
+    pub labels: Vec<String>,
     /// Shared total bandwidth bucket (`--bwlimit` / `--slow`).
     pub pacer: Option<Mutex<Pacer>>,
     /// True in `--dry-run` mode (no mutations at all).
@@ -84,9 +86,16 @@ pub struct EngineCtx {
 }
 
 impl EngineCtx {
-    pub fn new(tasks: Vec<TaskBar>, pacer: Option<Mutex<Pacer>>, dry_run: bool, suffix: String) -> Self {
+    pub fn new(
+        ui: Arc<ProgressUi>,
+        labels: Vec<String>,
+        pacer: Option<Mutex<Pacer>>,
+        dry_run: bool,
+        suffix: String,
+    ) -> Self {
         Self {
-            tasks,
+            ui,
+            labels,
             pacer,
             dry_run,
             suffix,

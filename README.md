@@ -14,14 +14,28 @@ bars**, and **YAML config files** — written in Rust, with
 $ psync -av --stats -j 4 src/ dst/
 Starting Copy. Total data: 195.4 KB
 
-dst/ 195.4KB [███████████████████████████▏] 195.4KB/195.4KB (100%) 3.2MiB/s
-Copy operation finished after 0.3s.
+s photos/a.jpg   [████████████████████████████████████████] 97.7 KB/97.7 KB (100%) 1.6 MB/s ETA 0s
+s videos/b.mov   [███████████████████████▊                  ] 48.8 KB/97.7 KB (50%) 1.5 MB/s ETA 0s
+. total          [███████████████████████████████▋          ] 146.5 KB/195.4 KB (75%) 3.1 MB/s ETA 0s
+
+done: the file bars clear; the final total line stays.
 Number of files transferred: 10
 Total transferred file size: 195.4 KB
 ```
 
 Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
 `tick_chars(".sSs.")` for spinners (see `progress.rs`).
+
+- **Cadence:** redraws and the spinner animate at a steady 250 ms
+  (`enable_steady_tick`) — smooth, low-CPU, no erratic spinner.
+- **Fits your terminal:** file names are front-ellipsized (`…tail.bin`)
+  so every line stays within the terminal width; on narrow terminals the
+  speed drops out of the line.
+- **Units:** sizes default to the classic KB = 1024 B convention;
+  `--si-units` switches to strict SI (kB = 1000 B) everywhere.
+- **One bar per active file** (at most `-j` at a time) plus one grand
+  total bar; skipped/hard-linked files count into the total instantly, so
+  an up-to-date run shows no bars at all.
 
 ## Features
 
@@ -30,9 +44,10 @@ Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
   link-dest, …) — see `psync --help` for the full surface.
 - **Parallel copies**: `-j/--jobs N` worker threads share one job queue; a
   single token-bucket pacer enforces the `--bwlimit` *total* rate, like rsync.
-- **Live progress** via `indicatif`: one bar per destination, file/byte
-  counts, human-readable stats (`-h`), `--stats` summary, `--itemize-changes`
-  (`*aiuc`-style lines), `--log-file`.
+- **Live progress** via `indicatif`: one bar per active file (up to `-j`
+  at a time) + a grand total bar, human-readable sizes/speeds,
+  250 ms smooth cadence, `--si-units`, `--stats` summary,
+  `--itemize-changes` (`*aiuc`-style lines), `--log-file`.
 - **Config mode**: `psync -C config.yaml` — drop-in replacement for
   **pybackupsync**: UUID-based drive mounting, per-destination `path`,
   `priority`, `compare` (size/sizeTime/timeSize/checksum), deletion policies

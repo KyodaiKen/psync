@@ -14,7 +14,7 @@
 
 use std::io::Write;
 
-use crate::fsutil::format_bytes;
+use crate::fsutil::{format_bytes, format_speed, Units};
 
 #[derive(Debug, Clone)]
 pub struct ItemizeLine {
@@ -28,10 +28,10 @@ pub struct ItemizeLine {
 impl ItemizeLine {
     /// Render in the custom `out-format` if given; supports the tokens
     /// `%i` (itemize triple), `%n` (name), `%b` (bytes).
-    pub fn render(&self, fmt: Option<&str>, _human: bool) -> String {
+    pub fn render(&self, fmt: Option<&str>, _human: bool, units: Units) -> String {
         let triple = format!("{}{}{}", self.kind, self.action, self.flags);
         match fmt {
-            Some(f) if !f.is_empty() => f.replace("%i", &triple).replace("%n", &self.rel).replace("%b", &format_bytes(self.bytes)),
+            Some(f) if !f.is_empty() => f.replace("%i", &triple).replace("%n", &self.rel).replace("%b", &format_bytes(self.bytes, units)),
             _ => format!("{:<10} {}", triple, self.rel),
         }
     }
@@ -52,12 +52,13 @@ pub struct Summary {
     pub cancelled_jobs: u64,
     pub elapsed_secs: f64,
     pub human: bool,
+    pub units: Units,
 }
 
 impl Summary {
     pub fn render(&self) -> String {
         let mut s = String::new();
-        let size = |n: u64| format_bytes(n);
+        let size = |n: u64| format_bytes(n, self.units);
         s.push_str(&format!("Number of files scanned:          {:>8}\n", self.files_scanned));
         s.push_str(&format!("Number of files transferred:      {:>8}\n", self.copied_files));
         s.push_str(&format!("Total transferred file size:      {:>8}\n", size(self.copied_bytes)));
@@ -82,8 +83,8 @@ impl Summary {
         if self.elapsed_secs > 0.0 {
             let avg = self.copied_bytes as f64 / self.elapsed_secs;
             s.push_str(&format!(
-                "Average transfer speed:         {:>12}/s\n",
-                format_bytes(avg as u64)
+                "Average transfer speed:         {:>12}\n",
+                format_speed(avg, self.units)
             ));
         }
         s
@@ -96,7 +97,7 @@ pub fn write_log_file(path: &std::path::Path, lines: &[ItemizeLine]) -> std::io:
     let f = std::fs::File::create(path)?;
     let mut w = BufWriter::new(f);
     for line in lines {
-        writeln!(w, "{}", line.render(None, false))?;
+        writeln!(w, "{}", line.render(None, false, Units::Jedec))?;
     }
     Ok(())
 }
