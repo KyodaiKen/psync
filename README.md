@@ -8,11 +8,14 @@
 $ psync -av --stats -j 4 src/ dst/
 Starting Copy. Total data: 195.4 KB
 
-  dst/ 33.3MB [==============================] 4 files, 100%
+dst/ 195.4KB [███████████████████████████▏] 195.4KB/195.4KB (100%) 3.2MiB/s
 Copy operation finished after 0.3s.
 Number of files transferred: 10
 Total transferred file size: 195.4 KB
 ```
+
+Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
+`tick_chars(".sSs.")` for spinners (see `progress.rs`).
 
 ## Features
 
