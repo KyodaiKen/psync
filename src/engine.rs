@@ -490,8 +490,9 @@ fn run_node(
     let perm = mode & 0o7777;
     // Device nodes and FIFOs are created with coreutils (`mkfifo(1)` /
     // `mknod(1)`): fixed argument vectors, no shell, and no `unsafe` in our
-    // crate. Creating them still requires root — a non-root failure is
-    // reported per file, exactly like rsync would.
+    // crate. FIFOs need only write access to the destination directory;
+    // device nodes need root/CAP_MKNOD. A failure is reported per file,
+    // exactly like rsync would.
     let out = match kind {
         crate::plan::NodeKind::Fifo => std::process::Command::new("mkfifo").arg(dst).output(),
         crate::plan::NodeKind::CharDev(major, minor) => std::process::Command::new("mknod")

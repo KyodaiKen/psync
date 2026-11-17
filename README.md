@@ -131,7 +131,10 @@ Behavior notes:
 - Local-only: `-z`, `--timeout`, `--numeric-ids`, `-s` are accepted and
   ignored; remote `user@host::` specs are rejected.
 - `--delete-during` is mapped to `--delete-before`.
-- Devices/FIFOs need root; otherwise they are skipped with a warning.
+- Device nodes (char/block) need root (`mknod`); without it they are
+  reported as per-file errors, not silently skipped. FIFOs only need write
+  access to the destination directory; restoring ownership to another user
+  always needs root.
 
 ## Project layout
 
