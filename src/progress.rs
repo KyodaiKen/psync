@@ -188,6 +188,7 @@ impl ProgressUi {
         let (bar, msg) = self.make_bar(label, total_bytes);
         bar.set_message(msg);
         bar.enable_steady_tick(TICK);
+        self.inner.multi.add(bar.clone());
         *self.inner.total_bar.lock().unwrap() = Some(bar);
     }
 
