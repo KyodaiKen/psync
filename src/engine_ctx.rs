@@ -116,7 +116,9 @@ impl EngineCtx {
     }
 
     pub fn add_warning(&self, msg: String) {
-        eprintln!("warning: {msg}");
+        // Routed through the UI so the line coexists with the live frame
+        // (while it runs) and prints plainly otherwise (dry runs, errors).
+        self.ui.println(&format!("warning: {msg}"));
         self.warnings
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -124,11 +126,12 @@ impl EngineCtx {
     }
 
     pub fn add_event(&self, msg: String) {
-        if !self.dry_run {
-            eprintln!("{msg}");
+        let line = if self.dry_run {
+            format!("[dry-run] {msg}")
         } else {
-            eprintln!("[dry-run] {msg}");
-        }
+            msg.clone()
+        };
+        self.ui.println(&line);
         self.events
             .lock()
             .unwrap_or_else(|p| p.into_inner())

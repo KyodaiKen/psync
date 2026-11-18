@@ -1,5 +1,5 @@
 //! psync — rsync-compatible local synchronizer with parallel transfer and
-//! live `indicatif` progress bars.
+//! live progress bars.
 //!
 //! Two modes:
 //! * **rsync mode** — `psync [OPTIONS] SRC... DST` with the full rsync
@@ -166,7 +166,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     } else {
         fsutil::Units::Jedec
     };
-    let ui = progress::ProgressUi::new(units);
+    let ui = progress::ProgressUi::new(units, cli.width);
     let spin = ui.spinner("scan", "scanning source…");
 
     let scan_opts = plan::ScanOpts {
@@ -183,7 +183,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     };
 
     let mut plan = plan::scan_sources(&specs, &scan_opts)?;
-    spin.finish_and_clear();
+    spin.finish();
 
     let decide = plan::DecideOpts {
         checksum: cli.checksum,
@@ -348,6 +348,13 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     // Grand total bar (one bar per active file is opened by the workers
     // as they go). Skipped when nothing will be copied — no stray bar.
     if plan.total_copy_bytes > 0 {
+        let hints: Vec<(String, u64)> = plan
+            .files
+            .iter()
+            .filter(|f| !matches!(f.action, plan::FileAction::Skip(_)))
+            .map(|f| (f.rel.clone(), f.size))
+            .collect();
+        ui.set_file_hints(&hints);
         ui.begin_total("total", plan.total_copy_bytes);
     }
 
@@ -364,7 +371,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     if cli.delete || cli.delete_before || cli.delete_during {
         let spin = ui.spinner("del", "deleting extraneous files…");
         execute_deletes(&delete_plan, &ctx);
-        spin.finish_and_clear();
+        spin.finish();
     }
 
     // Build the job list.
@@ -430,7 +437,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     if cli.delete_after {
         let spin = ui.spinner("del", "deleting extraneous files…");
         execute_deletes(&delete_plan, &ctx);
-        spin.finish_and_clear();
+        spin.finish();
     }
 
     Ok(final_report(cli, &ctx, &plan, &itemize, &ui))
@@ -522,7 +529,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     } else {
         fsutil::Units::Jedec
     };
-    let ui = progress::ProgressUi::new(units);
+    let ui = progress::ProgressUi::new(units, cli.width);
     let spin = ui.spinner("scan", &format!("scanning {}", src_root.display()));
     let base_plan = plan::scan_sources(
         &[plan::SourceSpec {
@@ -531,7 +538,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
         }],
         &scan_opts,
     )?;
-    spin.finish_and_clear();
+    spin.finish();
 
     if base_plan.files.is_empty() && base_plan.links.is_empty() && base_plan.nodes.is_empty()
     {
@@ -770,8 +777,17 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     }
 
     // ---- progress: one bar per active file (workers open them as they
-    // go) + one grand total bar
+    // go) + one grand total bar. The file set is known now, so the name
+    // and message columns are fixed for the whole run.
     if total_new_bytes > 0 {
+        let hints: Vec<(String, u64)> = jobs
+            .iter()
+            .filter_map(|j| match j {
+                engine::Job::File { rel, size, .. } => Some((rel.clone(), *size)),
+                _ => None,
+            })
+            .collect();
+        ui.set_file_hints(&hints);
         ui.begin_total("total", total_new_bytes);
     }
 
@@ -780,23 +796,24 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     let labels: Vec<String> = dests.iter().map(|d| d.label.clone()).collect();
     let ctx = Arc::new(EngineCtx::new(ui.clone(), labels, pacer, false, "~".into()));
 
-    eprintln!(
+    ui.println(&format!(
         "Starting Copy. Total data: {}",
         fsutil::format_bytes(total_new_bytes, units)
-    );
+    ));
 
     let n_workers = cli.jobs.unwrap_or(cfg.max_parallel_processes);
     let pool = engine::WorkerPool::spawn(n_workers, ctx.clone());
     pool.push(jobs);
     pool.join();
 
-    // ---- unmount auto-mounted drives (prompt unless -U)
+    ui.finish_all();
+
+    // ---- unmount auto-mounted drives (prompt unless -U); the UI is
+    // finished first so the prompt never collides with the live frame.
     let mut auto = registry.take_auto_mounted();
     if !auto.is_empty() {
         mount::unmount_all(&mut auto, !cli.umount);
     }
-
-    ui.finish_all();
     let errors: Vec<_> = {
         let g = ctx.errors.lock().unwrap_or_else(|p| p.into_inner());
         g.clone()

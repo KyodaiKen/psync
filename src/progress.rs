@@ -1,40 +1,58 @@
-//! Live progress UI built on `indicatif`.
+//! Live progress UI with a custom single-threaded renderer.
 //!
-//! Layout — one live bar per active file (at most `-j` at a time, each
-//! named, ellipsized to the terminal width), plus one grand total bar:
+//! Why not `indicatif::MultiProgress`? Three classes of artifacts were
+//! observed on real terminals (verified with PTY byte captures):
+//! * `finish_and_clear` leaves the finished bar's final line "zombied" on
+//!   screen (indicatif 0.17.11 treats removed leading bars as log lines),
+//! * the first burst ticks draw the bar on its own default target before
+//!   `multi.add()` rebinds it,
+//! * lines padded to exactly the terminal width leave the cursor in a
+//!   pending-wrap state, so on terminals that resolve the wrap before the
+//!   next `\r`, every subsequent frame lands one line lower and the old
+//!   frame is left as a stale ghost.
+//!
+//! So psync renders its own small UI with a strict protocol that is
+//! deterministic on any terminal:
+//!
+//! 1. No line is ever written exactly to the terminal's right edge, so the
+//!    cursor can never enter a pending-wrap state.
+//! 2. All terminal writes happen on one 250 ms ticker thread (plus the
+//!    final frame), so frames can never interleave.
+//! 3. Each frame: move up `prev_lines` lines, clear them top-to-bottom,
+//!    then rewrite the frame's lines. Unambiguous when every line is
+//!    shorter than the terminal width.
+//!
+//! Layout: one live line per active file plus one grand-total line. The
+//! name (prefix) column and the message column have fixed widths computed
+//! once from the whole planned file set, so every job's line lines up
+//! perfectly; long names are front-ellipsized to exactly that width.
 //!
 //! ```text
-//! . photos/2026/cat.jpg  [██████████▌        ] 1.2GB/4.5GB (27%) 412MB/s ETA 9s
-//! . videos/old.mov       [████▉              ] 800MB/9.1GB (9%) 406MB/s ETA 31s
-//! total                  [█████              ] 2.0GB/13.6GB (15%) 818MB/s ETA 19s
+//! . photos/cat.jpg      [████████▌     ] 1.2 GB/4.5 GB (27%) 412 MB/s ETA 9s
+//! . videos/old.mov      [████        ] 800 MB/9.1 GB (9%) 406 MB/s ETA 31s
+//! total                 [█████       ] 2.0 GB/13.6 GB (15%) 818 MB/s ETA 19s
 //! ```
-//!
-//! * Redraws and spinner animation run at a steady 250 ms cadence
-//!   (`enable_steady_tick`): fluent, low CPU, no erratic spinner.
-//! * Values reported from copy chunks are throttled to the same cadence.
-//! * Sizes/speeds are human-readable using the unit convention chosen at
-//!   startup (`Units::Jedec` default: 1 KB = 1024 B; `Units::Si`: 1 KB = 1000 B).
-//! * Names are front-ellipsized ("…long/tail.bin") so the whole line
-//!   fits the terminal width.
-//! * Styling exactly as specified: `.tick_chars(".sSs.")` and
-//!   `.progress_chars("█▉▊▋▌▍▎▏ ")`.
-//!
-//! Bars for files that are skipped (up to date, checksum identical, hard
-//! linked) need no live bar; their bytes are accounted in the total bar
-//! instantly. A destination with nothing to copy therefore never shows a
-//! stray, never-updating bar.
 
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::fsutil::{format_bytes, format_speed, Units};
 
 /// Steady redraw / spinner animation cadence: fluent and cheap.
 const TICK: Duration = Duration::from_millis(250);
+
+/// Spinner animation characters (as specified).
+const TICK_CHARS: [char; 4] = ['.', 's', 'S', 's'];
+
+/// Bar fill characters, 8 sub-cells to blank (as specified).
+const BAR_CHARS: [char; 9] = ['█', '▉', '▊', '▋', '▌', '▍', '▎', '▏', ' '];
+
+/// ETAs longer than this are capped (keeps the message width bounded).
+const MAX_ETA_SECS: u64 = 9 * 3600 + 59 * 60;
 
 /// Terminal width in columns (fallback: 80).
 fn term_width() -> usize {
@@ -44,9 +62,9 @@ fn term_width() -> usize {
         .max(40)
 }
 
-/// Human-readable ETA (indicatif-style "9s", "2m05s", "1h03m").
+/// Human-readable ETA like `9s`, `2m05s`, `1h03m` (capped at 9h59m).
 fn fmt_eta(d: Duration) -> String {
-    let s = d.as_secs();
+    let s = d.as_secs().min(MAX_ETA_SECS);
     if s < 60 {
         format!("{s}s")
     } else if s < 3600 {
@@ -56,310 +74,623 @@ fn fmt_eta(d: Duration) -> String {
     }
 }
 
-/// Bar style for a bar of the given width.
-fn bar_style(width: usize) -> ProgressStyle {
-    ProgressStyle::with_template(&format!(
-        "{{spinner}} {{prefix}} [{{bar:{width}}}] {{msg}}"
-    ))
-    .expect("valid template")
-    .progress_chars("█▉▊▋▌▍▎▏ ")
-    .tick_chars(".sSs.")
-}
-
-/// Spinner style for the scanning/deletion phases.
-fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner} {prefix} {msg}")
-        .expect("valid template")
-        .tick_chars(".sSs.")
-}
-
-/// Front-ellipsize `name` to at most `max` chars, keeping the tail
-/// (the file name).
-fn ellipsize(name: &str, max: usize) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    if chars.len() <= max {
-        return name.to_string();
+/// The longest `format_bytes` string that any value `<= size` can produce
+/// (the maximum is either at `size` itself or just below a unit boundary,
+/// e.g. "999.9 MB").
+fn worst_size_str(size: u64, units: Units) -> String {
+    let base = units.base();
+    let mut best = (0usize, format_bytes(size, units));
+    let mut p = base;
+    for _ in 0..5 {
+        if p > size as f64 {
+            break;
+        }
+        let cand = format_bytes((p - 1.0) as u64, units);
+        if cand.chars().count() > best.0 {
+            best = (cand.chars().count(), cand);
+        }
+        p *= base;
     }
-    if max <= 1 {
-        return "…".to_string();
+    if format_bytes(size, units).chars().count() > best.0 {
+        best = (
+            format_bytes(size, units).chars().count(),
+            format_bytes(size, units),
+        );
     }
-    let tail: String = chars[chars.len() - max..].iter().collect();
-    format!("…{tail}")
+    best.1
 }
 
-/// Shared UI state (behind one `Arc`).
-struct Inner {
-    multi: MultiProgress,
-    units: Units,
-    /// True on narrow terminals: the message drops the speed so the
-    /// whole line always fits the width.
+/// The longest message a bar of `size` bytes can show (worst-case done
+/// string on both sides, 100%, max speed, max ETA).
+fn worst_msg(size: u64, units: Units, compact: bool) -> String {
+    let b = worst_size_str(size, units);
+    if compact {
+        format!("{b}/{b} (100%) ETA 9h59m")
+    } else {
+        format!("{b}/{b} (100%) 999.9 TB/s ETA 9h59m")
+    }
+}
+
+/// Fixed per-run layout: every bar line is
+/// `tick ' ' name ' ' '[' bar ']' ' ' msg` with `name` exactly `name_w`
+/// chars and `msg` exactly `msg_w` chars, so all jobs align perfectly and
+/// each line is exactly `name_w + bar_w + msg_w + 7` columns — always
+/// strictly inside the terminal width.
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    width: usize,
+    bar_w: usize,
+    name_w: usize,
+    msg_w: usize,
     compact: bool,
-    total_bar: Mutex<Option<ProgressBar>>,
-    total_done: AtomicU64,
+}
+
+fn compute_layout(width: usize, units: Units, hints: &[(String, u64)], total: Option<u64>) -> Layout {
+    let longest_name = hints
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .chain(std::iter::once(5usize)) // "total", "scan", "del"
+        .max()
+        .unwrap_or(5);
+    let sizes: Vec<u64> = hints.iter().map(|(_, s)| *s).chain(total).collect();
+
+    for compact in [width < 70, true] {
+        let msg_w = sizes
+            .iter()
+            .map(|s| worst_msg(*s, units, compact).chars().count())
+            .max()
+            .unwrap_or_else(|| worst_msg(0, units, compact).chars().count());
+        let bar_w = 40usize.min(width / 3).max(10);
+        let name_w = longest_name
+            .min(width.saturating_sub(7 + bar_w + msg_w))
+            .max(4);
+        if 7 + bar_w + msg_w + name_w <= width {
+            return Layout {
+                width,
+                bar_w,
+                name_w,
+                msg_w,
+                compact,
+            };
+        }
+    }
+
+    // Extremely narrow terminal: shrink the bar to make room.
+    let compact = true;
+    let msg_w = sizes
+        .iter()
+        .map(|s| worst_msg(*s, units, compact).chars().count())
+        .max()
+        .unwrap_or_else(|| worst_msg(0, units, compact).chars().count());
+    let bar_w = 6usize;
+    let name_w = longest_name
+        .min(width.saturating_sub(7 + bar_w + msg_w))
+        .max(4);
+    Layout {
+        width,
+        bar_w,
+        name_w,
+        msg_w,
+        compact,
+    }
+}
+
+/// Front-ellipsize `name` to exactly `w` chars (keep the tail), or left-pad
+/// it with spaces when it is shorter — the column always lands at the same
+/// position.
+fn fit_name(name: &str, w: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= w {
+        let mut s = name.to_string();
+        s.push_str(&" ".repeat(w - chars.len()));
+        s
+    } else if w <= 1 {
+        "…".to_string()
+    } else {
+        let tail: String = chars[chars.len() - w + 1..].iter().collect();
+        format!("…{tail}")
+    }
+}
+
+/// One bar's state (total or file).
+struct BarState {
+    name: String,
+    size: u64,
+    done: u64,
+    start: Instant,
+    /// Last value seen by the ticker (for per-tick rate estimation).
+    last_done: u64,
+    last_tick: Instant,
+    /// Smoothed rate in bytes/s.
+    rate: f64,
+}
+
+impl BarState {
+    fn new(name: String, size: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            name,
+            size,
+            done: 0,
+            start: now,
+            last_done: 0,
+            last_tick: now,
+            rate: 0.0,
+        }
+    }
+
+    /// Update the smoothed rate from the value change since the last tick.
+    fn update_rate(&mut self, now: Instant) {
+        let dt = now.duration_since(self.last_tick).as_secs_f64().clamp(0.0, 2.0);
+        let delta = self.done.saturating_sub(self.last_done) as f64;
+        self.last_done = self.done;
+        self.last_tick = now;
+        if dt <= 0.0 || delta == 0.0 {
+            if delta == 0.0 {
+                self.rate = 0.0;
+            }
+            return;
+        }
+        let inst = delta / dt;
+        self.rate = if self.rate <= 0.0 {
+            inst
+        } else {
+            0.3 * inst + 0.7 * self.rate
+        };
+    }
+}
+
+struct State {
+    /// Persistent text lines (warnings, notes) shown above the live frame.
+    orphans: Vec<String>,
+    /// Phase spinner (scan/delete), shown alone while it runs.
+    spinner: Option<(String, String)>,
+    total: Option<BarState>,
+    files: Vec<BarState>,
+    layout: Layout,
+    hints: Vec<(String, u64)>,
+    /// Global tick counter (drives the spinner characters).
+    tick: usize,
+    /// Lines of the previously rendered frame (incl. orphans).
+    prev_lines: usize,
+    /// True once any spinner/bar has been started (for `println` routing).
+    ui_started: bool,
+    /// True after the final frame has been rendered.
+    finished: bool,
+    /// True once the frame has been anchored at the top of the screen
+    /// (first non-empty frame clears the screen and draws at line 0, so
+    /// frame growth can never scroll the screen and strand top lines).
+    anchored: bool,
+}
+
+struct Inner {
+    state: Mutex<State>,
+    wait: Condvar,
+    units: Units,
+    hidden: bool,
+    /// Set when the UI must stop ticking.
+    stop: AtomicBool,
+    /// Serializes the actual terminal writes (ticker vs final frame).
+    write_lock: Mutex<()>,
+    ticker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Inner {
-    /// Refresh the total bar's value and message.
-    fn refresh_total(&self) {
-        let Ok(guard) = self.total_bar.lock() else { return };
-        let Some(tb) = guard.as_ref() else { return };
-        let done = self.total_done.load(Ordering::Relaxed);
-        let total = tb.length().unwrap_or(0);
-        let units = self.units;
-        let compact = self.compact;
-        tb.set_position(done);
-        tb.set_message(format_total(done, total, units, tb, compact));
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Compute the frame lines from the current state.
+    fn frame_lines(s: &State, units: Units) -> Vec<String> {
+        let layout = s.layout;
+        let tick = TICK_CHARS[s.tick % TICK_CHARS.len()];
+        let mut lines: Vec<String> = Vec::new();
+        for o in &s.orphans {
+            lines.push(o.chars().take(layout.width.saturating_sub(1)).collect());
+        }
+        if let Some((prefix, msg)) = &s.spinner {
+            lines.push(spinner_line(layout, tick, prefix, msg));
+        }
+        if let Some(t) = &s.total {
+            lines.push(bar_line(layout, tick, t, units));
+        }
+        for f in &s.files {
+            lines.push(bar_line(layout, tick, f, units));
+        }
+        lines
     }
 }
 
-/// `1.2GB/4.5GB (27%) 412MB/s ETA 9s` (without the speed on narrow
-/// terminals — the line must always fit the width).
-fn stats_str(done: u64, total: u64, units: Units, bar: &ProgressBar, compact: bool) -> String {
-    let pct = if total == 0 {
-        0.0
+/// `.` + name column + message column (phase spinner).
+fn spinner_line(layout: Layout, tick: char, name: &str, msg: &str) -> String {
+    format!(
+        "{tick} {} {}",
+        fit_name(name, layout.name_w),
+        pad_to(msg, layout.msg_w)
+    )
+}
+
+/// `{tick} {name} [{bar}] {msg}` — the fixed-width bar line.
+fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units) -> String {
+    let done = b.done.min(b.size);
+    let frac = if b.size == 0 {
+        1.0
     } else {
-        done as f64 * 100.0 / total as f64
+        done as f64 / b.size as f64
     };
-    if compact {
-        format!(
-            "{}/{} ({:.0}%) ETA {}",
-            format_bytes(done, units),
-            format_bytes(total, units),
-            pct,
-            fmt_eta(bar.eta())
-        )
+    let fill = frac * layout.bar_w as f64;
+    let full = fill as usize;
+    let rem = ((fill - full as f64) * 8.0) as usize;
+    let mut bar = String::with_capacity(layout.bar_w);
+    for i in 0..layout.bar_w {
+        if i < full {
+            bar.push('█');
+        } else if i == full {
+            bar.push(BAR_CHARS[rem.min(8)]);
+        } else {
+            bar.push(' ');
+        }
+    }
+    let pct = if b.size == 0 { 0.0 } else { done as f64 * 100.0 / b.size as f64 };
+    let eta = if done >= b.size {
+        "0s".to_string()
+    } else if b.rate > 0.0 {
+        let remaining = b.size.saturating_sub(done) as f64 / b.rate;
+        fmt_eta(Duration::from_secs(remaining.min(MAX_ETA_SECS as f64) as u64))
     } else {
-        format!(
-            "{}/{} ({:.0}%) {} ETA {}",
-            format_bytes(done, units),
-            format_bytes(total, units),
-            pct,
-            format_speed(bar.per_sec(), units),
-            fmt_eta(bar.eta())
-        )
+        "--".to_string()
+    };
+    let v = format_speed(b.rate, units);
+    let d = format_bytes(done, units);
+    let s = format_bytes(b.size, units);
+    let msg = if layout.compact {
+        format!("{d}/{s} ({pct:.0}%) ETA {eta}")
+    } else {
+        format!("{d}/{s} ({pct:.0}%) {v} ETA {eta}")
+    };
+    format!(
+        "{tick} {} [{bar}] {}",
+        fit_name(&b.name, layout.name_w),
+        pad_to(&msg, layout.msg_w)
+    )
+}
+
+fn pad_to(s: &str, w: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= w {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(w - chars.len()))
     }
 }
 
-fn format_total(done: u64, total: u64, units: Units, bar: &ProgressBar, compact: bool) -> String {
-    stats_str(done, total, units, bar, compact)
+/// Render one frame: clear the previous frame's lines (top-to-bottom), then
+/// write the new lines. Every line is shorter than the terminal width, so
+/// the cursor can never be in a pending-wrap state and the up/clear/down
+/// dance is unambiguous on any terminal.
+fn render_frame(inner: &Inner, final_frame: bool) {
+    if inner.hidden {
+        return;
+    }
+    let lines = {
+        let mut s = inner.state();
+        if !final_frame {
+            let now = Instant::now();
+            s.tick += 1;
+            if let Some(t) = &mut s.total {
+                t.update_rate(now);
+            }
+            for f in &mut s.files {
+                f.update_rate(now);
+            }
+        }
+        Inner::frame_lines(&s, inner.units)
+    };
+
+    let prev = inner.state().prev_lines;
+    let anchored = inner.state().anchored;
+    let mut out = String::new();
+    if !anchored && !lines.is_empty() {
+        // First frame: take over the screen. Drawing at line 0 keeps the
+        // invariant "frame top at line 0" so growth never scrolls the
+        // screen and no previous line can ever be stranded.
+        out.push_str("\x1b[2J\x1b[H");
+    } else if prev > 0 {
+        out.push_str(&format!("\x1b[{prev}A"));
+        for i in 0..prev {
+            out.push_str("\r\x1b[2K");
+            if i + 1 < prev {
+                out.push_str("\x1b[1B");
+            }
+        }
+        if prev > 1 {
+            out.push_str(&format!("\x1b[{}A", prev - 1));
+        }
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    let n = lines.len();
+
+    let _wl = inner.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+    let mut err = std::io::stderr();
+    if let Err(e) = err.write_all(out.as_bytes()) {
+        eprintln!("psync: error writing progress UI: {e}");
+    }
+    if final_frame {
+        let _ = err.write_all(b"\n");
+    }
+    let _ = err.flush();
+    drop(_wl);
+
+    let mut s = inner.state();
+    s.prev_lines = n;
+    s.anchored = s.anchored || !lines.is_empty();
+    if final_frame {
+        s.finished = true;
+    }
 }
 
-/// The whole progress surface. Cheaply shared: workers hold `Arc` clones
-/// (all indicatif bars are thread-safe clone handles).
+/// The shared progress surface. Cheaply shared: workers hold `Arc` clones.
 pub struct ProgressUi {
     inner: Arc<Inner>,
-    hidden: bool,
-    width: usize,
+}
+
+/// Handle for a phase spinner (scan/delete).
+pub struct Spinner {
+    inner: Arc<Inner>,
+}
+
+impl Spinner {
+    /// End the spinner: its line is cleared on the next render (immediate).
+    pub fn finish(self) {
+        if self.inner.hidden {
+            return;
+        }
+        {
+            let mut s = self.inner.state();
+            s.spinner = None;
+        }
+        self.inner.wait.notify_all();
+    }
+}
+
+/// Handle for one live file bar (cloneable; the bar is shared state).
+#[derive(Clone)]
+pub struct FileBar {
+    inner: Arc<Inner>,
+    key: String,
+}
+
+impl FileBar {
+    /// Report cumulative copied bytes. The value is stored (and the total
+    /// bar advances by the delta); the UI renders on its own 250 ms
+    /// cadence.
+    pub fn report(&self, done: u64) {
+        if self.inner.hidden {
+            return;
+        }
+        let mut s = self.inner.state();
+        if let Some(f) = s.files.iter_mut().find(|f| f.name == self.key) {
+            let old = f.done;
+            let new_done = done.max(old);
+            if new_done > old {
+                f.done = new_done;
+                if let Some(t) = &mut s.total {
+                    t.done += new_done - old;
+                }
+            }
+        }
+    }
+
+    /// Finish the file: store the exact final value (when known — always on
+    /// a successful copy, so the total bar lands at 100%), advance the
+    /// total by the remaining delta, then drop the bar's line from the
+    /// frame.
+    pub fn finish(&self, final_bytes: Option<u64>) {
+        if self.inner.hidden {
+            return;
+        }
+        {
+            let mut s = self.inner.state();
+            if let Some(pos) = s.files.iter().position(|f| f.name == self.key) {
+                let old = s.files[pos].done;
+                if let Some(d) = final_bytes {
+                    let new_done = d.max(old);
+                    s.files[pos].done = new_done;
+                    if new_done > old {
+                        if let Some(t) = &mut s.total {
+                            t.done += new_done - old;
+                        }
+                    }
+                }
+                s.files.remove(pos);
+            }
+        }
+        self.inner.wait.notify_all();
+    }
 }
 
 impl ProgressUi {
     /// Create the UI (hidden automatically when stdout is not a TTY).
-    pub fn new(units: Units) -> Arc<Self> {
+    /// `width_override` forces the terminal width (for testing).
+    pub fn new(units: Units, width_override: Option<usize>) -> Arc<Self> {
         let hidden = !std::io::stdout().is_terminal();
-        let multi = MultiProgress::new();
-        if hidden {
-            multi.set_draw_target(ProgressDrawTarget::hidden());
-        }
-        let width = term_width();
+        let width = width_override.unwrap_or_else(term_width).max(20);
+        let state = State {
+            orphans: Vec::new(),
+            spinner: None,
+            total: None,
+            files: Vec::new(),
+            layout: compute_layout(width, units, &[], None),
+            hints: Vec::new(),
+            tick: 0,
+            prev_lines: 0,
+            ui_started: false,
+            finished: false,
+            anchored: false,
+        };
         let inner = Arc::new(Inner {
-            multi,
+            state: Mutex::new(state),
+            wait: Condvar::new(),
             units,
-            compact: width < 70,
-            total_bar: Mutex::new(None),
-            total_done: AtomicU64::new(0),
-        });
-        Arc::new(Self {
-            inner,
             hidden,
-            width,
-        })
+            stop: AtomicBool::new(false),
+            write_lock: Mutex::new(()),
+            ticker: Mutex::new(None),
+        });
+        let ui = Arc::new(ProgressUi {
+            inner: Arc::clone(&inner),
+        });
+        if !hidden {
+            let inner_clone = inner.clone();
+            let handle = thread::spawn(move || {
+                loop {
+                    if inner_clone.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    render_frame(&inner_clone, false);
+                    let _guard = match inner_clone
+                        .wait
+                        .wait_timeout(inner_clone.state(), TICK)
+                    {
+                        Ok((guard, _result)) => guard, // early wake or timeout: render again
+                        Err(p) => p.into_inner().0,
+                    };
+                }
+            });
+            *inner.ticker.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+        }
+        ui
     }
 
     pub fn units(&self) -> Units {
         self.inner.units
     }
 
+    pub fn is_hidden(&self) -> bool {
+        self.inner.hidden
+    }
+
     /// The grand total bar (call once with the planned byte count; skip
-    /// when nothing will be copied).
+    /// when nothing will be copied — no stray bar).
     pub fn begin_total(&self, label: &str, total_bytes: u64) {
-        if self.hidden || total_bytes == 0 {
+        if self.inner.hidden || total_bytes == 0 {
             return;
         }
-        let (bar, msg) = self.make_bar(label, total_bytes);
-        bar.set_message(msg);
-        bar.enable_steady_tick(TICK);
-        self.inner.multi.add(bar.clone());
-        *self.inner.total_bar.lock().unwrap() = Some(bar);
+        {
+            let mut s = self.inner.state();
+            s.total = Some(BarState::new(label.to_string(), total_bytes));
+            s.layout = compute_layout(s.layout.width, self.inner.units, &s.hints, Some(total_bytes));
+            s.ui_started = true;
+        }
+        self.inner.wait.notify_all();
+    }
+
+    /// Tell the UI the full planned file set (name + size) so the name and
+    /// message columns can be fixed for the whole run: every job's line
+    /// then has identical column widths, with the ellipsis fitting exactly.
+    pub fn set_file_hints(&self, hints: &[(String, u64)]) {
+        if self.inner.hidden {
+            return;
+        }
+        {
+            let mut s = self.inner.state();
+            s.hints = hints.to_vec();
+            s.layout = compute_layout(
+                s.layout.width,
+                self.inner.units,
+                &s.hints,
+                s.total.as_ref().map(|t| t.size),
+            );
+        }
+        self.inner.wait.notify_all();
     }
 
     /// Register a file that will be copied with a live bar.
     pub fn begin_file(&self, name: &str, size: u64) -> FileBar {
-        let bar = if self.hidden {
-            ProgressBar::hidden()
-        } else {
-            let (bar, msg) = self.make_bar(name, size);
-            bar.set_message(msg);
-            bar.enable_steady_tick(TICK);
-            self.inner.multi.add(bar.clone());
-            bar
-        };
+        if self.inner.hidden {
+            return FileBar {
+                inner: self.inner.clone(),
+                key: name.to_string(),
+            };
+        }
+        {
+            let mut s = self.inner.state();
+            if !s.files.iter().any(|f| f.name == name) {
+                s.files.push(BarState::new(name.to_string(), size));
+                s.ui_started = true;
+            }
+        }
+        self.inner.wait.notify_all();
         FileBar {
-            bar,
-            prev: Arc::new(AtomicU64::new(0)),
-            start: Arc::new(Instant::now()),
-            last: Arc::new(AtomicU64::new(0)),
             inner: self.inner.clone(),
-            hidden: self.hidden,
+            key: name.to_string(),
         }
     }
 
-    /// Account for bytes that need no live bar (skips, links): they land
-    /// in the total bar immediately.
+    /// Account for bytes that need no live bar (skips, links): they land in
+    /// the total bar immediately.
     pub fn skip_bytes(&self, n: u64) {
-        if self.hidden {
+        if self.inner.hidden {
             return;
         }
-        self.inner.total_done.fetch_add(n, Ordering::Relaxed);
-        self.inner.refresh_total();
-    }
-
-    /// A spinner for single-threaded phases (scanning, deleting, …).
-    pub fn spinner(&self, prefix: &str, msg: &str) -> ProgressBar {
-        let bar = ProgressBar::new(u64::MAX);
-        bar.set_style(spinner_style());
-        bar.set_prefix(prefix.to_string());
-        bar.set_message(msg.to_string());
-        bar.enable_steady_tick(TICK);
-        if !self.hidden {
-            self.inner.multi.add(bar.clone());
+        let mut s = self.inner.state();
+        if let Some(t) = &mut s.total {
+            t.done += n;
+            t.last_done = t.done;
         }
-        bar
     }
 
-    pub fn is_hidden(&self) -> bool {
-        self.hidden
-    }
-
-    /// Finish: keep the final total line. File bars remove themselves as
-    /// they complete and the phase spinners are cleared at their sites, so
-    /// nothing else should still be on screen here.
-    pub fn finish_all(&self) {
-        if self.hidden {
-            return;
+    /// A phase spinner (scanning/deleting). Call `finish()` when the phase
+    /// ends; the spinner's line is cleared, not left behind.
+    pub fn spinner(&self, prefix: &str, msg: &str) -> Spinner {
+        if !self.inner.hidden {
+            let mut s = self.inner.state();
+            s.spinner = Some((prefix.to_string(), msg.to_string()));
+            s.ui_started = true;
         }
-        let Ok(guard) = self.inner.total_bar.lock() else {
-            let _ = self.inner.multi.clear();
-            return;
+        self.inner.wait.notify_all();
+        Spinner {
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// Print a line that must coexist with the live UI: while the UI is
+    /// active it becomes a persistent line above the frame; otherwise it is
+    /// printed directly (dry runs, errors, pre-UI phases).
+    pub fn println(&self, text: &str) {
+        let active = {
+            let s = self.inner.state();
+            s.ui_started && !s.finished
         };
-        if let Some(tb) = guard.as_ref() {
-            let done = self.inner.total_done.load(Ordering::Relaxed);
-            let total_len = tb.length().unwrap_or(0);
-            let units = self.inner.units;
-            let compact = self.inner.compact;
-            tb.set_position(done);
-            tb.set_message(stats_str(done, total_len, units, tb, compact));
-            let _ = tb.finish();
-        }
-    }
-
-    /// Create a width-fitted bar: the name is ellipsized against the
-    /// *worst-case* message length (speed/ETA grow over time), and the bar
-    /// shrinks on narrow terminals so the line always fits.
-    fn make_bar(&self, name: &str, size: u64) -> (ProgressBar, String) {
-        let width = self.width;
-        let units = self.inner.units;
-        let compact = self.inner.compact;
-
-        // Worst-case message length (speed up to 999.9 TB/s, ETA up to 9h99m).
-        let total_str = format_bytes(size, units);
-        let msg_len = if compact {
-            format!("{total_str}/{total_str} (100%) ETA 9h99m").chars().count()
+        if !self.inner.hidden && active {
+            let mut s = self.inner.state();
+            s.orphans.push(text.to_string());
+            self.inner.wait.notify_all();
         } else {
-            format!("{total_str}/{total_str} (100%) 999.9 TB/s ETA 9h99m").chars().count()
-        };
-
-        // Fixed parts of the line: spinner(1) + " " + " [" + "] " = 6.
-        let mut bar_w = 40usize.min(width / 3).max(10);
-        let mut name_max = width.saturating_sub(6 + bar_w + msg_len);
-        if name_max < 8 {
-            // Very narrow terminal: shrink the bar, keep a readable name.
-            bar_w = width.saturating_sub(6 + msg_len + 8).max(6);
-            name_max = 8;
-        }
-        let name = ellipsize(name, name_max.max(1));
-
-        let bar = ProgressBar::new(size);
-        bar.set_style(bar_style(bar_w));
-        bar.set_prefix(name);
-        let msg = stats_str(0, size, units, &bar, compact);
-        (bar, msg)
-    }
-}
-
-/// Handle for one active file's bar. Cloneable and `Send + Sync` (all
-/// fields are shared handles), so the copy engine's chunk closure can
-/// move it freely.
-#[derive(Clone)]
-pub struct FileBar {
-    bar: ProgressBar,
-    /// Cumulative bytes last reported (for the total-bar delta).
-    prev: Arc<AtomicU64>,
-    /// Creation time of the bar (relative monotonic clock for the
-    /// report throttle).
-    start: Arc<Instant>,
-    /// Elapsed nanoseconds at the last UI update (throttle).
-    last: Arc<AtomicU64>,
-    inner: Arc<Inner>,
-    hidden: bool,
-}
-
-impl FileBar {
-    /// Report cumulative copied bytes. Throttled to the 250 ms cadence;
-    /// the final value is always reported on [`FileBar::finish`].
-    pub fn report(&self, done: u64) {
-        if self.hidden {
-            return;
-        }
-        let now = self.start.elapsed().as_nanos() as u64;
-        if now < self.last.load(Ordering::Relaxed) + TICK.as_nanos() as u64 {
-            return;
-        }
-        self.last.store(now, Ordering::Relaxed);
-
-        let prev_done = self.prev.swap(done, Ordering::Relaxed);
-        let delta = done.saturating_sub(prev_done);
-        let units = self.inner.units;
-        let compact = self.inner.compact;
-        self.bar.set_position(done);
-        self.bar
-            .set_message(stats_str(done, self.bar.length().unwrap_or(done), units, &self.bar, compact));
-        if delta > 0 {
-            self.inner.total_done.fetch_add(delta, Ordering::Relaxed);
-            self.inner.refresh_total();
+            eprintln!("{text}");
         }
     }
 
-    /// Finish the file: report the exact final value (when known — always
-    /// passed on a successful copy, so the total bar lands at 100%), then
-    /// clear the bar's line.
-    pub fn finish(&self, final_bytes: Option<u64>) {
-        if self.hidden {
+    /// Finish: render the final frame (persistent lines + the total bar at
+    /// its final value), leave it on screen, stop the ticker, and leave the
+    /// cursor on a fresh line for the summary. Idempotent.
+    pub fn finish_all(&self) {
+        if self.inner.hidden {
             return;
         }
-        let done = final_bytes.unwrap_or_else(|| self.prev.load(Ordering::Relaxed));
-        let prev_done = self.prev.swap(done, Ordering::Relaxed);
-        let delta = done.saturating_sub(prev_done);
-        let units = self.inner.units;
-        let compact = self.inner.compact;
-        self.bar.set_position(done);
-        self.bar
-            .set_message(stats_str(done, self.bar.length().unwrap_or(done), units, &self.bar, compact));
-        if delta > 0 {
-            self.inner.total_done.fetch_add(delta, Ordering::Relaxed);
-            self.inner.refresh_total();
+        if self.inner.state().finished {
+            return;
         }
-        let _ = self.inner.multi.remove(&self.bar);
-        // Marks the bar finished: its steady-ticker thread exits.
-        let _ = self.bar.finish();
+        self.inner.stop.store(true, Ordering::Relaxed);
+        self.inner.wait.notify_all();
+        render_frame(&self.inner, true);
+        if let Some(handle) = self.inner.ticker.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = handle.join();
+        }
     }
 }

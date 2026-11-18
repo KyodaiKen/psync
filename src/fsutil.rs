@@ -94,7 +94,7 @@ pub enum Units {
 }
 
 impl Units {
-    fn base(self) -> f64 {
+    pub fn base(self) -> f64 {
         match self {
             Units::Jedec => 1024.0,
             Units::Si => 1000.0,

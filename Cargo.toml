@@ -6,7 +6,7 @@ rust-version = "1.80"
 description = "psync — rsync-compatible local file synchronizer with parallel transfer, live progress bars and pybackupsync-compatible YAML config mode"
 license = "MIT"
 readme = "README.md"
-keywords = ["rsync", "backup", "sync", "parallel", "indicatif"]
+keywords = ["rsync", "backup", "sync", "parallel", "progress"]
 categories = ["command-line-utilities", "filesystem"]
 
 [[bin]]
@@ -16,7 +16,6 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
-indicatif = "0.17"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

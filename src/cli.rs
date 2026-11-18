@@ -119,6 +119,10 @@ pub struct Cli {
     /// JEDEC-style convention (1 KB = 1024 B) in progress bars and stats.
     #[arg(long = "si-units", help = "use strict SI units (kB=1000 B) instead of KB=1024 B")]
     pub si_units: bool,
+
+    /// Force the terminal width for the progress UI (testing).
+    #[arg(long = "width", value_name = "COLS", help = "override terminal width for the progress UI (testing)")]
+    pub width: Option<usize>,
     /// Keep partially transferred files.
     #[arg(short = 'P', long = "partial")]
     pub partial: bool,

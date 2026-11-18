@@ -2,8 +2,9 @@
 //!
 //! * `WorkerPool` — N std threads pulling jobs off a mutex + condvar queue.
 //!   All shared state lives behind `Arc<Mutex<..>>` / atomics (see
-//!   [`engine_ctx`]); indicatif bars are cheap clone handles into one
-//!   thread-safe `MultiProgress`. The crate is `#![forbid(unsafe_code)]`,
+//!   [`engine_ctx`]); progress handles are cheap clone references into
+//!   one thread-safe UI (see `progress`). The crate is
+//!   `#![forbid(unsafe_code)]`,
 //!   so there are no raw pointers, no unsynchronized accesses, no races.
 //! * Jobs are pre-sorted by priority (pybackupsync scheduling: destination
 //!   priority, then destination uuid, then stable order), so parallel tasks

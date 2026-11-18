@@ -26,11 +26,18 @@ Total transferred file size: 195.4 KB
 Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
 `tick_chars(".sSs.")` for spinners (see `progress.rs`).
 
-- **Cadence:** redraws and the spinner animate at a steady 250 ms
-  (`enable_steady_tick`) — smooth, low-CPU, no erratic spinner.
+- **Cadence:** redraws and the spinner animate at a steady 250 ms —
+  smooth, low-CPU, no erratic spinner. Rendering is a small single-threaded
+  custom engine (not `indicatif`): the frame is anchored at the top of the
+  screen, cleared and rewritten as one unit, so finished bars never leave
+  stale lines behind.
 - **Fits your terminal:** file names are front-ellipsized (`…tail.bin`)
-  so every line stays within the terminal width; on narrow terminals the
-  speed drops out of the line.
+  so every line stays strictly inside the terminal width; on narrow
+  terminals the speed drops out of the line. `--width COLS` overrides the
+  detected width (for testing).
+- **Perfectly aligned columns:** the name and message column widths are
+  computed once from the *whole* planned file set, so every job's line has
+  identical column widths and the ellipsis fits exactly.
 - **Units:** sizes default to the classic KB = 1024 B convention;
   `--si-units` switches to strict SI (kB = 1000 B) everywhere.
 - **One bar per active file** (at most `-j` at a time) plus one grand
@@ -44,10 +51,12 @@ Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
   link-dest, …) — see `psync --help` for the full surface.
 - **Parallel copies**: `-j/--jobs N` worker threads share one job queue; a
   single token-bucket pacer enforces the `--bwlimit` *total* rate, like rsync.
-- **Live progress** via `indicatif`: one bar per active file (up to `-j`
-  at a time) + a grand total bar, human-readable sizes/speeds,
-  250 ms smooth cadence, `--si-units`, `--stats` summary,
-  `--itemize-changes` (`*aiuc`-style lines), `--log-file`.
+- **Live progress** (custom single-threaded renderer): one bar per active
+  file (up to `-j` at a time) + a grand total bar, perfectly aligned
+  name/message columns, human-readable sizes/speeds, 250 ms smooth cadence,
+  `--si-units`, `--stats` summary, `--itemize-changes` (`*aiuc`-style
+  lines), `--log-file`. Warnings and phase messages coexist with the live
+  frame as persistent lines above it.
 - **Config mode**: `psync -C config.yaml` — drop-in replacement for
   **pybackupsync**: UUID-based drive mounting, per-destination `path`,
   `priority`, `compare` (size/sizeTime/timeSize/checksum), deletion policies
@@ -170,7 +179,7 @@ src/
   fsutil.rs      copy engine, SHA-256, token-bucket Pacer, formatting
   filter.rs      rsync-style include/exclude rules + delete protection
   mount.rs       UUID mounting, space checks, auto-unmount
-  progress.rs    indicatif bars/spinners
+  progress.rs    custom 250 ms renderer: aligned bars + phase spinners
   report.rs      itemize lines + stats summary
   cancel.rs      SIGINT/SIGTERM flag (signal-hook, async-signal safe)
   space.rs       free-space vs. needed-space logic
