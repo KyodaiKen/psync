@@ -430,7 +430,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     // Run the worker pool.
     let n_workers = cli.jobs.unwrap_or(2);
     let pool = engine::WorkerPool::spawn(n_workers, ctx.clone());
-    pool.push(jobs);
+    pool.push(vec![(0, jobs)]);
     pool.join();
 
     // Post-processing (dir mtimes, --chmod).
@@ -700,12 +700,11 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     // destination's files before the next destination's, so with the
     // per-destination lock the second destination could only start once
     // the first destination's first file finished. Instead each
-    // destination keeps its own queue (plan order preserved) and
-    // destinations interleave round-robin within a priority tier
-    // (lower value = runs first, default 99): one job per destination
-    // per pass, in scheduling order. Every destination starts at the
-    // same time; one-job-per-destination stays enforced by the engine's
-    // per-destination locks.
+    // destination keeps its own queue (plan order preserved); the pool
+    // scans them in selection order (lower priority value first, default
+    // 99, then scheduling order) and skips destinations that are busy —
+    // every destination starts at the same time, one-job-per-destination
+    // stays enforced by the pool's per-destination locks.
     let mut keyed: Vec<(u32, usize, String, engine::Job)> = Vec::new();
     for (di, dp) in dests.iter().enumerate() {
         for f in &dp.plan.files {
@@ -767,37 +766,20 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             ));
         }
     }
-    let mut jobs: Vec<engine::Job> = Vec::new();
-    {
-        use std::collections::{BTreeMap, VecDeque};
-        let mut tier: BTreeMap<u32, Vec<(usize, VecDeque<engine::Job>)>> = BTreeMap::new();
-        for (pri, di, _rel, job) in keyed {
-            let cols = tier.entry(pri).or_default();
-            match cols.iter_mut().find(|(d, _)| *d == di) {
-                Some((_, q)) => q.push_back(job),
-                None => {
-                    let mut q = VecDeque::new();
-                    q.push_back(job);
-                    cols.push((di, q));
-                }
-            }
+    // One queue per destination (dests is already in scheduling order:
+    // priority, then sort_key); within a queue the plan order is kept.
+    // All jobs of a destination share its priority, so the first job
+    // seen for each di sets the group's priority.
+    let mut groups: Vec<(u32, Vec<engine::Job>)> = Vec::new();
+    for (pri, di, _rel, job) in keyed {
+        if di >= groups.len() {
+            groups.push((pri, Vec::new()));
         }
-        for (_, mut cols) in tier {
-            let mut any = true;
-            while any {
-                any = false;
-                for (_, q) in cols.iter_mut() {
-                    if let Some(j) = q.pop_front() {
-                        jobs.push(j);
-                        any = true;
-                    }
-                }
-            }
-        }
+        groups[di].1.push(job);
     }
 
     let total_new_bytes: u64 = dests.iter().map(|d| d.plan.total_copy_bytes).sum();
-    let nothing = jobs.is_empty();
+    let nothing = groups.iter().all(|(_, q)| q.is_empty());
 
     if dry {
         // The scan spinner may have used the alternate screen; back to the
@@ -820,8 +802,9 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     let pacer = cli.bwlimit_kib().map(|k| Mutex::new(fsutil::Pacer::new(k)));
     let labels: Vec<String> = dests.iter().map(|d| d.label.clone()).collect();
     if total_new_bytes > 0 {
-        let hints: Vec<(String, u64)> = jobs
+        let hints: Vec<(String, u64)> = groups
             .iter()
+            .flat_map(|(_, q)| q.iter())
             .filter_map(|j| match j {
                 // Config mode names the *destination* file (shared prefix
                 // stripped), so each line shows which copy it is.
@@ -847,7 +830,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
 
     let n_workers = cli.jobs.unwrap_or(cfg.max_parallel_processes);
     let pool = engine::WorkerPool::spawn(n_workers, ctx.clone());
-    pool.push(jobs);
+    pool.push(groups);
     pool.join();
 
     ui.finish_all();

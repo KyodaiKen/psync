@@ -6,16 +6,18 @@
 //!   one thread-safe UI (see `progress`). The crate is
 //!   `#![forbid(unsafe_code)]`,
 //!   so there are no raw pointers, no unsynchronized accesses, no races.
-//! * Jobs are pre-scheduled pybackupsync-style: each destination keeps its
-//!   own queue (plan order preserved), and within a priority tier (lower
-//!   value = runs first, default 99) destinations interleave round-robin —
-//!   one job per destination per pass, in scheduling order — so every
-//!   destination starts at the same time. Each destination keeps its own
-//!   task bar showing its *full* progress (all its files, not just the
-//!   current one) while the bar message still names the file currently
+//! * Jobs are scheduled pybackupsync-style: each destination keeps its own
+//!   queue (plan order preserved). Workers scan the destination queues in
+//!   selection order (lower priority value first, default 99, then
+//!   scheduling order) and take the first destination that has work and a
+//!   free lock — so every destination starts at the same time,
+//!   higher-priority destinations get first claim on each freed worker,
+//!   and no destination starves behind a busy one. Each destination keeps
+//!   its own task bar showing its *full* progress (all its files, not just
+//!   the current one) while the bar message still names the file currently
 //!   being processed.
-//! * Only **one job per destination** runs at a time (per-destination
-//!   mutex, keyed by the job's `task_id`): concurrent writes to the same
+//! * Only **one job per destination** runs at a time (the queue's
+//!   `active` set, keyed by the job's `task_id`): concurrent writes to the same
 //!   disk fragment files and stall spinning drives. This is how
 //!   `pybackupsync` scheduled tasks — distinct destinations still run
 //!   fully in parallel.
@@ -23,7 +25,7 @@
 //!   live progress, cancellation between chunks and a shared bandwidth
 //!   bucket (`--bwlimit` limits the total rate, like rsync).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -96,17 +98,19 @@ impl Job {
 
 /// Shared queue of pending jobs.
 struct QueueState {
-    pending: VecDeque<Job>,
+    /// One queue per destination, in selection order (priority, then
+    /// scheduling order). Workers scan this order to pick work.
+    queues: Vec<(u32, VecDeque<Job>)>,
+    /// Destinations currently executing a job. A destination may only be
+    /// picked while it is *not* in this set, so no two jobs ever write
+    /// to the same destination at once.
+    active: std::collections::HashSet<usize>,
     shutdown: bool,
 }
 
 struct Shared {
     queue: Mutex<QueueState>,
     cond: Condvar,
-    /// Per-destination mutexes, keyed by job `task_id` (the destination
-    /// index). A job may only run while holding its destination's lock,
-    /// so no two jobs ever write to the same destination at once.
-    dest_locks: Mutex<HashMap<usize, Arc<Mutex<()>>>>,
 }
 
 /// A pool of worker threads executing jobs.
@@ -120,11 +124,11 @@ impl WorkerPool {
     pub fn spawn(n: usize, ctx: Arc<EngineCtx>) -> Self {
         let shared = Arc::new(Shared {
             queue: Mutex::new(QueueState {
-                pending: VecDeque::new(),
+                queues: Vec::new(),
+                active: std::collections::HashSet::new(),
                 shutdown: false,
             }),
             cond: Condvar::new(),
-            dest_locks: Mutex::new(HashMap::new()),
         });
         let mut threads = Vec::with_capacity(n);
         for i in 0..n {
@@ -139,11 +143,15 @@ impl WorkerPool {
         Self { shared, threads }
     }
 
-    /// Enqueue jobs (already sorted by priority).
-    pub fn push(&self, jobs: Vec<Job>) {
+    /// Enqueue one job queue per destination, in selection order
+    /// (lower priority value = picked first; within a priority,
+    /// scheduling order). Within each queue the plan order is kept.
+    pub fn push(&self, groups: Vec<(u32, Vec<Job>)>) {
         {
             let mut st = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-            st.pending.extend(jobs);
+            for (priority, jobs) in groups {
+                st.queues.push((priority, jobs.into_iter().collect()));
+            }
         }
         self.shared.cond.notify_all();
     }
@@ -161,51 +169,74 @@ impl WorkerPool {
     }
 }
 
+/// Pick the next job: scan the destinations in selection order (priority,
+/// then scheduling order) and take the first one that has pending work
+/// and is not already executing a job. This way every destination
+/// starts immediately — a worker never sits behind a busy
+/// higher-priority destination — higher-priority destinations get first
+/// claim on each freed worker, and one-job-per-destination stays
+/// enforced by the `active` set.
+fn pick_job(shared: &Shared) -> Option<(Job, usize)> {
+    let mut st = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        // First queue (in selection order) with work on a free
+        // destination; busy destinations are skipped.
+        let idx = st.queues.iter().position(|(_, q)| {
+            q.front().is_some_and(|j| !st.active.contains(&j.task_id()))
+        });
+        if let Some(idx) = idx {
+            let job = st.queues[idx].1.pop_front().unwrap();
+            let tid = job.task_id();
+            st.active.insert(tid);
+            return Some((job, tid));
+        }
+        // Queue drained: only now does shutdown (no more work will come)
+        // end this worker. Checking the queue first guarantees a worker
+        // that wakes on the shutdown notify still drains pending jobs —
+        // join() must never lose queued work.
+        if st.shutdown {
+            return None;
+        }
+        // Every destination with work is busy: wait for one to finish.
+        st = shared
+            .cond
+            .wait(st)
+            .unwrap_or_else(|p| p.into_inner());
+    }
+}
+
+/// Free a destination (its job finished) and wake a waiting worker.
+fn release_dest(shared: &Shared, tid: usize) {
+    let mut st = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+    st.active.remove(&tid);
+    drop(st);
+    shared.cond.notify_all();
+}
+
 fn worker_loop(shared: &Shared, ctx: &Arc<EngineCtx>) {
     loop {
-        let job_opt = {
-            let mut st = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-            loop {
-                if let Some(j) = st.pending.pop_front() {
-                    break Some(j);
-                }
-                if st.shutdown {
-                    break None;
-                }
-                st = shared
-                    .cond
-                    .wait(st)
-                    .unwrap_or_else(|p| p.into_inner());
-            }
-        };
-        let Some(job) = job_opt else {
+        let Some((job, tid)) = pick_job(shared) else {
             break;
         };
         if cancel::is_cancelled() {
             ctx.record_cancelled();
+            release_dest(shared, tid);
             continue;
         }
-        // Serialize per destination: acquire this job's destination lock
-        // (keyed by task_id) and hold it for the whole job — execute()
-        // opens and closes the file bar under it, so the previous file's
-        // bar is fully closed before the next one opens. A worker whose
-        // destination is busy simply waits here; workers on other
-        // destinations keep copying.
-        let dest_lock = {
-            let mut locks = shared
-                .dest_locks
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            locks
-                .entry(job.task_id())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _dest_guard = dest_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let outcome = execute(&job, ctx);
-        ctx.finish_job(outcome);
-        // _dest_guard drops here: the next job for this destination may
-        // proceed.
+        // The destination is ours until we release it: execute() opens
+        // and closes the file bar, and the previous file's bar is fully
+        // closed before the next one opens. Contain a panicking job so
+        // the destination is always freed (the pool can't hang) and this
+        // worker keeps serving other jobs.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let outcome = execute(&job, ctx);
+            ctx.finish_job(outcome);
+            release_dest(shared, tid);
+        }))
+        .is_err();
+        if panicked {
+            eprintln!("warning: a job panicked; the destination was released");
+        }
     }
 }
 
@@ -565,5 +596,88 @@ fn run_node(
                 error: AppError::io(format!("running node-creation tool for '{}'", dst.display()), e),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine_ctx::EngineCtx;
+    use crate::progress::ProgressUi;
+
+    /// Regression test for the shutdown race: main() pushes all jobs and
+    /// calls join() immediately, so the worker threads may still be
+    /// starting up when `shutdown` is set. Workers must drain every queued
+    /// job — join() must never lose work that was already enqueued. (The
+    /// old pick_job checked `shutdown` before the queue and bailed,
+    /// dropping the whole queue.)
+    #[test]
+    fn join_drains_jobs_pushed_before_it() {
+        let base = std::env::temp_dir().join(format!(
+            "psync-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = base.join("src");
+        let dst_a = base.join("dstA");
+        let dst_b = base.join("dstB");
+        for d in [&src_dir, &dst_a, &dst_b] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let payload: Vec<u8> = (0..256u16).map(|i| (i % 251) as u8).collect();
+        let mut groups: Vec<(u32, Vec<Job>)> = Vec::new();
+        for (di, pri, dst) in [(0usize, 1u32, &dst_a), (1usize, 2u32, &dst_b)] {
+            let mut jobs = Vec::new();
+            for i in 0..4 {
+                let name = format!("f{i}.bin");
+                let src = src_dir.join(&name);
+                fs::write(&src, &payload).unwrap();
+                jobs.push(Job::File {
+                    task_id: di,
+                    rel: name.clone(),
+                    src,
+                    dst: dst.join(&name),
+                    size: payload.len() as u64,
+                    keep_partial: false,
+                    preserve_perms: true,
+                    preserve_time: true,
+                    preserve_owner: None,
+                    verify_checksum: false,
+                    backup: false,
+                    link_to: None,
+                    remove_source: false,
+                    temp_dir: None,
+                });
+            }
+            groups.push((pri, jobs));
+        }
+        let ui = ProgressUi::new(fsutil::Units::Si, None);
+        let ctx = Arc::new(EngineCtx::new(
+            ui,
+            vec![String::from("A"), String::from("B")],
+            None,
+            false,
+            String::new(),
+            true,
+        ));
+        let pool = WorkerPool::spawn(2, ctx.clone());
+        pool.push(groups);
+        // This is the exact main() sequence: join right after push.
+        pool.join();
+        for dst in [&dst_a, &dst_b] {
+            for i in 0..4 {
+                let p = dst.join(format!("f{i}.bin"));
+                assert!(p.is_file(), "missing {}", p.display());
+                assert_eq!(fs::read(&p).unwrap(), payload, "bad content in {}", p.display());
+            }
+        }
+        assert_eq!(
+            ctx.copied_files.load(std::sync::atomic::Ordering::Relaxed),
+            8
+        );
+        fs::remove_dir_all(&base).ok();
     }
 }
