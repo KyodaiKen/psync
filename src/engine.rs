@@ -19,6 +19,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -414,6 +415,10 @@ fn run_file(
                 }
             }
             ctx.record_transferred(dst.to_path_buf());
+            if done != size {
+                // Source size changed mid-copy; the live bar already warns.
+                ctx.changed_files.fetch_add(1, Ordering::Relaxed);
+            }
             fbar.finish(Some(done));
             JobOutcome::Copied { bytes: done }
         }

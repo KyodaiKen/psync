@@ -481,7 +481,12 @@ pub fn bind_destination(plan: &mut Plan, dst_root: &Path, opts: &DecideOpts) -> 
             FileAction::Copy | FileAction::VerifyChecksum | FileAction::Backup => {
                 plan.total_copy_bytes += f.size;
             }
-            FileAction::LinkDest(_) | FileAction::HardLink(_) => {}
+            FileAction::LinkDest(_) | FileAction::HardLink(_) => {
+                // Materialized whole at the destination; the engine credits
+                // them via skip_bytes, so the total's target must include
+                // them too (or the grand bar overfills).
+                plan.total_copy_bytes += f.size;
+            }
             FileAction::Skip(reason) => {
                 plan.skipped += 1;
                 if *reason == "destination is not a regular file" {

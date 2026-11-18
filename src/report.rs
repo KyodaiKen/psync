@@ -45,6 +45,9 @@ pub struct Summary {
     pub links_scanned: u64,
     pub copied_files: u64,
     pub copied_bytes: u64,
+    /// Source files that changed size while being copied (partial at
+    /// destination when they shrank).
+    pub changed_files: u64,
     pub linked_files: u64,
     pub skipped_files: u64,
     pub deleted_files: u64,
@@ -64,6 +67,12 @@ impl Summary {
         rows.push(("Number of files scanned", self.files_scanned.to_string()));
         rows.push(("Number of files transferred", self.copied_files.to_string()));
         rows.push(("Total transferred file size", size(self.copied_bytes)));
+        if self.changed_files > 0 {
+            rows.push((
+                "Files changed during copy (PARTIAL)",
+                self.changed_files.to_string(),
+            ));
+        }
         if self.linked_files > 0 {
             rows.push(("Number of files hard-linked", self.linked_files.to_string()));
         }

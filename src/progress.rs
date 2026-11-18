@@ -505,7 +505,11 @@ fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units, color: bool,
     if color {
         bar.push_str("\x1b[0m");
     }
-    let pct = if b.size == 0 { 0.0 } else { done as f64 * 100.0 / b.size as f64 };
+    let pct = if b.size == 0 {
+        0.0
+    } else {
+        (done as f64 * 100.0 / b.size as f64).min(100.0)
+    };
     let eta = if done >= b.size {
         "0s".to_string()
     } else if b.rate > 0.0 {
@@ -674,6 +678,14 @@ impl FileBar {
     /// a successful copy, so the total bar lands at 100%), advance the
     /// total by the remaining delta, then drop the bar's line from the
     /// frame.
+    ///
+    /// If the source file's size *changed* while it was being copied
+    /// (download still running, file re-written, …), the final value
+    /// differs from the scan-time plan: the bar and the total bar are
+    /// re-based to the real amount so they still close at 100%, and a
+    /// warning line is pushed (a shrunken source means the destination
+    /// file is partial — the next run re-copies it, since the sizes
+    /// differ).
     pub fn finish(&self, final_bytes: Option<u64>) {
         if self.inner.hidden {
             return;
@@ -682,13 +694,43 @@ impl FileBar {
             let mut s = self.inner.state();
             if let Some(pos) = s.files.iter().position(|f| f.name == self.key) {
                 let old = s.files[pos].done;
+                let planned = s.files[pos].size;
                 if let Some(d) = final_bytes {
                     let new_done = d.max(old);
                     s.files[pos].done = new_done;
-                    if new_done > old {
-                        if let Some(t) = &mut s.total {
+                    if let Some(t) = &mut s.total {
+                        if new_done > old {
                             t.done += new_done - old;
                         }
+                        // Keep the total's denominator honest: count what
+                        // was actually transferred, not the stale
+                        // scan-time size (independent of whether this
+                        // final report advanced the bar).
+                        if d < planned {
+                            t.size = t.size.saturating_sub(planned - d);
+                        } else if d > planned {
+                            t.size += d - planned;
+                        }
+                    }
+                    if d != planned {
+                        // Close the file bar at 100% of what really happened.
+                        s.files[pos].size = new_done;
+                        let line = if d < planned {
+                            format!(
+                                "warning: {}: source shrank during copy (planned {}, copied {}) — the destination file is PARTIAL",
+                                self.key,
+                                format_bytes(planned, self.inner.units),
+                                format_bytes(d, self.inner.units)
+                            )
+                        } else {
+                            format!(
+                                "note: {}: source grew during copy (planned {}, copied {})",
+                                self.key,
+                                format_bytes(planned, self.inner.units),
+                                format_bytes(d, self.inner.units)
+                            )
+                        };
+                        s.orphans.push((line, d < planned));
                     }
                 }
                 s.files.remove(pos);

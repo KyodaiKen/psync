@@ -841,6 +841,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             links_scanned: base_plan.links.len() as u64,
             copied_files: ctx.copied_files.load(Ordering::Relaxed),
             copied_bytes: ctx.copied_bytes.load(Ordering::Relaxed),
+            changed_files: ctx.changed_files.load(Ordering::Relaxed),
             linked_files: ctx.linked_files.load(Ordering::Relaxed),
             skipped_files: dests
                 .iter()
@@ -1161,6 +1162,7 @@ fn dry_summary(plan: &plan::Plan, human: bool, units: fsutil::Units) -> report::
         links_scanned: plan.links.len() as u64,
         copied_files: to_copy,
         copied_bytes: plan.total_copy_bytes,
+        changed_files: 0,
         linked_files: 0,
         skipped_files: plan.skipped,
         deleted_files: 0,
@@ -1205,6 +1207,7 @@ fn final_report(
             links_scanned: plan.links.len() as u64,
             copied_files: ctx.copied_files.load(Ordering::Relaxed),
             copied_bytes: ctx.copied_bytes.load(Ordering::Relaxed),
+            changed_files: ctx.changed_files.load(Ordering::Relaxed),
             linked_files: ctx.linked_files.load(Ordering::Relaxed),
             skipped_files: plan.skipped + ctx.skipped_files.load(Ordering::Relaxed),
             deleted_files: ctx.deleted_files.load(Ordering::Relaxed),

@@ -73,6 +73,9 @@ pub struct EngineCtx {
 
     pub copied_bytes: AtomicU64,
     pub copied_files: AtomicU64,
+    /// Files whose source size changed while they were copied (the
+    /// destination is a partial file when the source shrank).
+    pub changed_files: AtomicU64,
     pub skipped_files: AtomicU64,
     pub linked_files: AtomicU64,
     pub error_files: AtomicU64,
@@ -162,6 +165,7 @@ impl EngineCtx {
             started: Instant::now(),
             copied_bytes: AtomicU64::new(0),
             copied_files: AtomicU64::new(0),
+            changed_files: AtomicU64::new(0),
             skipped_files: AtomicU64::new(0),
             linked_files: AtomicU64::new(0),
             error_files: AtomicU64::new(0),
