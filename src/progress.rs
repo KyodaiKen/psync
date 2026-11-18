@@ -51,9 +51,9 @@
 //! The grand-total bar sits at the *bottom* of the frame.
 //!
 //! ```text
-//! . long-…n.bin [██████▊     ] 512.0 MB/1.1 GB (46%) 142.0 MB/s ETA 4s
-//! . long-…ar.gz [███████     ] 543.0 MB/1.1 GB (49%) 149.0 MB/s ETA 3s
-//! . total       [██████      ] 1.1 GB/3.4 GB (32%) 291.0 MB/s ETA 8s
+//! . long-…n.bin [██████▊     ] 512.000 MB/1.100 GB (46.00%) 142.000 MB/s ETA 4s
+//! . long-…ar.gz [███████     ] 543.000 MB/1.100 GB (49.00%) 149.000 MB/s ETA 3s
+//! . total       [██████      ] 1.100 GB/3.400 GB (32.00%) 291.000 MB/s ETA 8s
 //! ```
 
 use std::io::IsTerminal;
@@ -190,10 +190,11 @@ fn worst_size_str(size: u64, units: Units) -> String {
 /// string on both sides, 100%, max speed, max ETA).
 fn worst_msg(size: u64, units: Units, compact: bool) -> String {
     let b = worst_size_str(size, units);
+    let speed = format_speed(999_900_000_000.0, units); // widest plausible
     if compact {
-        format!("{b}/{b} (100%) ETA 9h59m")
+        format!("{b}/{b} (100.00%) ETA 9h59m")
     } else {
-        format!("{b}/{b} (100%) 999.9 TB/s ETA 9h59m")
+        format!("{b}/{b} (100.00%) {speed} ETA 9h59m")
     }
 }
 
@@ -537,9 +538,9 @@ fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units, color: bool,
     let d = format_bytes(done, units);
     let s = format_bytes(b.size, units);
     let msg = if layout.compact {
-        format!("{d}/{s} ({pct:.0}%) ETA {eta}")
+        format!("{d}/{s} ({pct:.2}%) ETA {eta}")
     } else {
-        format!("{d}/{s} ({pct:.0}%) {v} ETA {eta}")
+        format!("{d}/{s} ({pct:.2}%) {v} ETA {eta}")
     };
     let name = fit_name(&b.name, layout.name_w);
     let msg = pad_to(&msg, layout.msg_w);

@@ -116,7 +116,9 @@ pub fn format_bytes(n: u64, units: Units) -> String {
     if i == 0 {
         format!("{n} B")
     } else {
-        format!("{v:.1} {}", UNITS[i])
+        // Three decimals for every unit from KB up (as requested): the
+        // byte column stays whole ("5 B").
+        format!("{v:.3} {}", UNITS[i])
     }
 }
 
