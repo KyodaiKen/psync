@@ -12,11 +12,16 @@
 //!   bar showing its *full* progress (all its files, not just the current
 //!   one) while the bar message still names the file currently being
 //!   processed.
+//! * Only **one job per destination** runs at a time (per-destination
+//!   mutex, keyed by the job's `task_id`): concurrent writes to the same
+//!   disk fragment files and stall spinning drives. This is how
+//!   `pybackupsync` scheduled tasks — distinct destinations still run
+//!   fully in parallel.
 //! * Every file copy goes through the OS copy routine in 1 MiB chunks with
 //!   live progress, cancellation between chunks and a shared bandwidth
 //!   bucket (`--bwlimit` limits the total rate, like rsync).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -96,6 +101,10 @@ struct QueueState {
 struct Shared {
     queue: Mutex<QueueState>,
     cond: Condvar,
+    /// Per-destination mutexes, keyed by job `task_id` (the destination
+    /// index). A job may only run while holding its destination's lock,
+    /// so no two jobs ever write to the same destination at once.
+    dest_locks: Mutex<HashMap<usize, Arc<Mutex<()>>>>,
 }
 
 /// A pool of worker threads executing jobs.
@@ -113,6 +122,7 @@ impl WorkerPool {
                 shutdown: false,
             }),
             cond: Condvar::new(),
+            dest_locks: Mutex::new(HashMap::new()),
         });
         let mut threads = Vec::with_capacity(n);
         for i in 0..n {
@@ -173,8 +183,27 @@ fn worker_loop(shared: &Shared, ctx: &Arc<EngineCtx>) {
             ctx.record_cancelled();
             continue;
         }
+        // Serialize per destination: acquire this job's destination lock
+        // (keyed by task_id) and hold it for the whole job — execute()
+        // opens and closes the file bar under it, so the previous file's
+        // bar is fully closed before the next one opens. A worker whose
+        // destination is busy simply waits here; workers on other
+        // destinations keep copying.
+        let dest_lock = {
+            let mut locks = shared
+                .dest_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            locks
+                .entry(job.task_id())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _dest_guard = dest_lock.lock().unwrap_or_else(|p| p.into_inner());
         let outcome = execute(&job, ctx);
         ctx.finish_job(outcome);
+        // _dest_guard drops here: the next job for this destination may
+        // proceed.
     }
 }
 
