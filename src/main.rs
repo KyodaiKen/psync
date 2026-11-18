@@ -542,6 +542,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
 
     if base_plan.files.is_empty() && base_plan.links.is_empty() && base_plan.nodes.is_empty()
     {
+        ui.finish_all();
         eprintln!("No files found in source; nothing to do.");
         return Ok(0);
     }
@@ -568,7 +569,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
                 AppError::io(format!("creating destination {}", dst_root.display()), e)
             })?;
         }
-        eprintln!(
+        ui.println(&format!(
             "Destination {}: {}{} (priority {}, compare: {})",
             di + 1,
             base,
@@ -579,7 +580,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             },
             d.priority,
             d.compare
-        );
+        ));
 
         let decide = plan::DecideOpts {
             checksum: false,
@@ -609,7 +610,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             .collect();
 
         if to_copy.is_empty() {
-            eprintln!("  up to date.");
+            ui.println("  up to date.");
         } else {
             let needed: i64 = to_copy
                 .iter()
@@ -620,14 +621,14 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
                     f.size as i64 - existing
                 })
                 .sum();
-            eprintln!(
+            ui.println(&format!(
                 "  would copy {} files ({} new data)",
                 to_copy.len(),
                 fsutil::format_bytes(p.total_copy_bytes, units)
-            );
+            ));
             if needed > 0 && !dry {
                 if d.deletion_exclude_patterns.iter().any(|x| x.trim() == "*") {
-                    eprintln!("  (deletion disabled by deletion_exclude_patterns)");
+                    ui.println("  (deletion disabled by deletion_exclude_patterns)");
                 } else {
                     let mut dirset = std::collections::BTreeSet::new();
                     for f in &to_copy {
@@ -759,8 +760,12 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     let jobs: Vec<engine::Job> = keyed.into_iter().map(|t| t.3).collect();
 
     let total_new_bytes: u64 = dests.iter().map(|d| d.plan.total_copy_bytes).sum();
+    let nothing = jobs.is_empty();
 
     if dry {
+        // The scan spinner may have used the alternate screen; back to the
+        // main page before the dry-run report prints.
+        ui.finish_all();
         for dp in &dests {
             eprintln!(
                 "  [dry-run] would sync {} -> {}",
@@ -770,10 +775,6 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
         }
         eprintln!("Total data to copy: {}", fsutil::format_bytes(total_new_bytes, units));
         return Ok(0);
-    }
-
-    if jobs.is_empty() {
-        eprintln!("All destinations are up to date; nothing to copy.");
     }
 
     // ---- progress: one bar per active file (workers open them as they
@@ -807,6 +808,13 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     pool.join();
 
     ui.finish_all();
+
+    // The UI owns the alternate screen until here; from this point on the
+    // terminal is back on the main page, so these land in the normal
+    // scrollback.
+    if nothing {
+        eprintln!("All destinations are up to date; nothing to copy.");
+    }
 
     // ---- unmount auto-mounted drives (prompt unless -U); the UI is
     // finished first so the prompt never collides with the live frame.

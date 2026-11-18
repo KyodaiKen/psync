@@ -21,16 +21,29 @@
 //! 3. Each frame: move up `prev_lines` lines, clear them top-to-bottom,
 //!    then rewrite the frame's lines. Unambiguous when every line is
 //!    shorter than the terminal width.
+//! 4. The first frame enters the terminal's *alternate screen buffer*
+//!    (the vim/less-style "next page"); `finish_all` — or the death of the
+//!    process itself (SIGKILL included: modern terminals restore the
+//!    primary screen when the foreground program exits, and a panic hook
+//!    covers in-process panics) — returns to the primary screen, so the
+//!    shell prompt, scrollback, and the summary lines always land on the
+//!    main page.
+//!
+//! Look: modern 256-color styling — the bar fill rides a blue → green
+//! ramp that drifts across the bar as it fills (grand total: a brighter
+//! cyan ramp), with muted gray text; disabled automatically by `NO_COLOR`
+//! or `TERM=dumb`.
 //!
 //! Layout: one live line per active file plus one grand-total line. The
 //! name (prefix) column and the message column have fixed widths computed
 //! once from the whole planned file set, so every job's line lines up
 //! perfectly; long names are center-ellipsized to exactly that width.
+//! The grand-total bar sits at the *bottom* of the frame.
 //!
 //! ```text
-//! . photos/cat.jpg      [████████▌     ] 1.2 GB/4.5 GB (27%) 412 MB/s ETA 9s
-//! . videos/old.mov      [████        ] 800 MB/9.1 GB (9%) 406 MB/s ETA 31s
-//! total                 [█████       ] 2.0 GB/13.6 GB (15%) 818 MB/s ETA 19s
+//! . long-…n.bin [██████▊     ] 512.0 MB/1.1 GB (46%) 142.0 MB/s ETA 4s
+//! . long-…ar.gz [███████     ] 543.0 MB/1.1 GB (49%) 149.0 MB/s ETA 3s
+//! . total       [██████      ] 1.1 GB/3.4 GB (32%) 291.0 MB/s ETA 8s
 //! ```
 
 use std::io::IsTerminal;
@@ -51,8 +64,61 @@ const TICK_CHARS: [char; 4] = ['.', 's', 'S', 's'];
 /// Bar fill characters, 8 sub-cells to blank (as specified).
 const BAR_CHARS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
+/// Blue → green ramp for the bar fill (256-color indices): the hue drifts
+/// across the bar as it fills.
+const FILL_RAMP: [u8; 18] = [21, 22, 23, 24, 33, 34, 36, 38, 40, 42, 44, 46, 48, 52, 58, 66, 76, 84];
+
+/// Brighter cyan ramp for the grand-total bar.
+const TOTAL_RAMP: [u8; 8] = [81, 82, 83, 84, 85, 86, 87, 87];
+
+/// Muted colors (256-color indices).
+const COL_NAME: u8 = 252;
+const COL_NAME_GRAND: u8 = 255;
+const COL_MSG: u8 = 244;
+const COL_BAR_EMPTY: u8 = 236;
+const COL_BRACKET: u8 = 238;
+const COL_SPINNER: u8 = 87;
+const COL_WARNING: u8 = 214;
+
 /// ETAs longer than this are capped (keeps the message width bounded).
 const MAX_ETA_SECS: u64 = 9 * 3600 + 59 * 60;
+
+/// Tracked process-wide: the panic hook and any death path must be able to
+/// return to the primary screen without locking state.
+static ALT_ENTERED: AtomicBool = AtomicBool::new(false);
+
+/// Enter the terminal's alternate screen buffer (the vim/less-style
+/// "next page"): the whole UI lives there, the primary screen and its
+/// scrollback are untouched, and we return to it via
+/// `restore_alt_screen` (finish, error, cancel) or automatically when the
+/// process dies (SIGKILL included — modern terminals restore the primary
+/// screen when the foreground program exits).
+fn enter_alt_screen() {
+    ALT_ENTERED.store(true, Ordering::SeqCst);
+}
+
+/// Return to the primary screen (idempotent, thread-safe).
+fn restore_alt_screen() {
+    if !ALT_ENTERED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut err = std::io::stderr();
+    let _ = err.write_all(b"\x1b[0m\x1b[?1049l");
+    let _ = err.flush();
+}
+
+/// Install the panic hook once: restore the primary screen before the
+/// panic report prints, so the report lands on the main page.
+fn install_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_alt_screen();
+            default(info);
+        }));
+    });
+}
 
 /// Terminal width in columns (fallback: 80).
 fn term_width() -> usize {
@@ -315,6 +381,8 @@ struct Inner {
     wait: Condvar,
     units: Units,
     hidden: bool,
+    /// Color output (ANSI 256-color), off for NO_COLOR / TERM=dumb / pipes.
+    color: bool,
     /// Set when the UI must stop ticking.
     stop: AtomicBool,
     /// Serializes the actual terminal writes (ticker vs final frame).
@@ -328,37 +396,47 @@ impl Inner {
     }
 
     /// Compute the frame lines from the current state.
-    fn frame_lines(s: &State, units: Units) -> Vec<String> {
+    fn frame_lines(s: &State, units: Units, color: bool) -> Vec<String> {
         let layout = s.layout;
         let tick = TICK_CHARS[s.tick % TICK_CHARS.len()];
         let mut lines: Vec<String> = Vec::new();
         for o in &s.orphans {
-            lines.push(o.chars().take(layout.width.saturating_sub(1)).collect());
+            let l: String = o.chars().take(layout.width.saturating_sub(1)).collect();
+            lines.push(if color {
+                format!("\x1b[1;38;5;{COL_WARNING}m{l}\x1b[0m")
+            } else {
+                l
+            });
         }
         if let Some((prefix, msg)) = &s.spinner {
-            lines.push(spinner_line(layout, tick, prefix, msg));
-        }
-        if let Some(t) = &s.total {
-            lines.push(bar_line(layout, tick, t, units));
+            lines.push(spinner_line(layout, tick, prefix, msg, color));
         }
         for f in &s.files {
-            lines.push(bar_line(layout, tick, f, units));
+            lines.push(bar_line(layout, tick, f, units, color, false));
+        }
+        if let Some(t) = &s.total {
+            // Grand total bar: last, at the bottom of the frame.
+            lines.push(bar_line(layout, tick, t, units, color, true));
         }
         lines
     }
 }
 
 /// `.` + name column + message column (phase spinner).
-fn spinner_line(layout: Layout, tick: char, name: &str, msg: &str) -> String {
-    format!(
-        "{tick} {} {}",
-        fit_name(name, layout.name_w),
-        pad_to(msg, layout.msg_w)
-    )
+fn spinner_line(layout: Layout, tick: char, name: &str, msg: &str, color: bool) -> String {
+    let name = fit_name(name, layout.name_w);
+    let msg = pad_to(msg, layout.msg_w);
+    if color {
+        format!(
+            "\x1b[1;38;5;{COL_SPINNER}m{tick}\x1b[0m \x1b[38;5;{COL_NAME}m{name}\x1b[0m \x1b[38;5;{COL_MSG}m{msg}\x1b[0m"
+        )
+    } else {
+        format!("{tick} {name} {msg}")
+    }
 }
 
 /// `{tick} {name} [{bar}] {msg}` — the fixed-width bar line.
-fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units) -> String {
+fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units, color: bool, grand: bool) -> String {
     let done = b.done.min(b.size);
     let frac = if b.size == 0 {
         1.0
@@ -368,15 +446,31 @@ fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units) -> String {
     let fill = frac * layout.bar_w as f64;
     let full = fill as usize;
     let rem = ((fill - full as f64) * 8.0) as usize;
-    let mut bar = String::with_capacity(layout.bar_w);
+    let ramp: &[u8] = if grand { &TOTAL_RAMP[..] } else { &FILL_RAMP[..] };
+    let mut bar = String::with_capacity(layout.bar_w * (if color { 12 } else { 1 }));
     for i in 0..layout.bar_w {
-        if i < full {
-            bar.push('█');
+        let ch = if i < full {
+            '█'
         } else if i == full {
-            bar.push(BAR_CHARS[rem.min(8)]);
+            BAR_CHARS[rem.min(8)]
         } else {
-            bar.push(' ');
+            ' '
+        };
+        if color {
+            // Filled cells ride the blue→green ramp (position-scaled across
+            // the filled span); empty cells stay dark.
+            let col = if i <= full {
+                ramp[(i * (ramp.len() - 1) / full.max(1)).min(ramp.len() - 1)]
+            } else {
+                COL_BAR_EMPTY
+            };
+            bar.push_str(&format!("\x1b[38;5;{col}m{ch}"));
+        } else {
+            bar.push(ch);
         }
+    }
+    if color {
+        bar.push_str("\x1b[0m");
     }
     let pct = if b.size == 0 { 0.0 } else { done as f64 * 100.0 / b.size as f64 };
     let eta = if done >= b.size {
@@ -395,11 +489,17 @@ fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units) -> String {
     } else {
         format!("{d}/{s} ({pct:.0}%) {v} ETA {eta}")
     };
-    format!(
-        "{tick} {} [{bar}] {}",
-        fit_name(&b.name, layout.name_w),
-        pad_to(&msg, layout.msg_w)
-    )
+    let name = fit_name(&b.name, layout.name_w);
+    let msg = pad_to(&msg, layout.msg_w);
+    if color {
+        let name_csi = if grand { COL_NAME_GRAND } else { COL_NAME };
+        format!(
+            "\x1b[1;38;5;{COL_SPINNER}m{tick}\x1b[0m \x1b[{};38;5;{name_csi}m{name}\x1b[0m \x1b[38;5;{COL_BRACKET}m[\x1b[0m{bar}\x1b[38;5;{COL_BRACKET}m]\x1b[0m \x1b[38;5;{COL_MSG}m{msg}\x1b[0m",
+            if grand { "1" } else { "" }
+        )
+    } else {
+        format!("{tick} {name} [{bar}] {msg}")
+    }
 }
 
 fn pad_to(s: &str, w: usize) -> String {
@@ -431,17 +531,21 @@ fn render_frame(inner: &Inner, final_frame: bool) {
                 f.update_rate(now);
             }
         }
-        Inner::frame_lines(&s, inner.units)
+        Inner::frame_lines(&s, inner.units, inner.color)
     };
 
     let prev = inner.state().prev_lines;
     let anchored = inner.state().anchored;
     let mut out = String::new();
     if !anchored && !lines.is_empty() {
-        // First frame: take over the screen. Drawing at line 0 keeps the
-        // invariant "frame top at line 0" so growth never scrolls the
-        // screen and no previous line can ever be stranded.
-        out.push_str("\x1b[2J\x1b[H");
+        // First frame: take over the terminal's *alternate* screen
+        // (vim/less-style). The primary screen and its scrollback are left
+        // completely untouched; on finish — or when the process dies,
+        // however it dies — we (or the terminal) return to it. Clearing +
+        // homing the fresh screen also keeps the invariant "frame top at
+        // line 0", so growth never scrolls and no line can be stranded.
+        out.push_str("\x1b[?1049h");
+        enter_alt_screen();
     } else if prev > 0 {
         out.push_str(&format!("\x1b[{prev}A"));
         for i in 0..prev {
@@ -566,6 +670,9 @@ impl ProgressUi {
     /// `width_override` forces the terminal width (for testing).
     pub fn new(units: Units, width_override: Option<usize>) -> Arc<Self> {
         let hidden = !std::io::stdout().is_terminal();
+        let color = !hidden
+            && std::env::var_os("NO_COLOR").map(|v| v.as_os_str().is_empty()).unwrap_or(true)
+            && std::env::var_os("TERM").map(|t| t != "dumb").unwrap_or(true);
         let width = width_override.unwrap_or_else(term_width).max(20);
         let state = State {
             orphans: Vec::new(),
@@ -585,6 +692,7 @@ impl ProgressUi {
             wait: Condvar::new(),
             units,
             hidden,
+            color,
             stop: AtomicBool::new(false),
             write_lock: Mutex::new(()),
             ticker: Mutex::new(None),
@@ -593,6 +701,7 @@ impl ProgressUi {
             inner: Arc::clone(&inner),
         });
         if !hidden {
+            install_panic_hook();
             let inner_clone = inner.clone();
             let handle = thread::spawn(move || {
                 loop {
@@ -723,9 +832,10 @@ impl ProgressUi {
         }
     }
 
-    /// Finish: render the final frame (persistent lines + the total bar at
-    /// its final value), leave it on screen, stop the ticker, and leave the
-    /// cursor on a fresh line for the summary. Idempotent.
+    /// Finish: stop the ticker, render the final frame on the alternate
+    /// screen (persistent lines + the total bar at its final value), then
+    /// return to the primary screen so the summary printed afterwards lands
+    /// on the main page. Idempotent.
     pub fn finish_all(&self) {
         if self.inner.hidden {
             return;
@@ -735,9 +845,12 @@ impl ProgressUi {
         }
         self.inner.stop.store(true, Ordering::Relaxed);
         self.inner.wait.notify_all();
-        render_frame(&self.inner, true);
+        // Reap the ticker *before* the final frame so it cannot race the
+        // last write (at most one tick period of wait).
         if let Some(handle) = self.inner.ticker.lock().unwrap_or_else(|p| p.into_inner()).take() {
             let _ = handle.join();
         }
+        render_frame(&self.inner, true);
+        restore_alt_screen();
     }
 }

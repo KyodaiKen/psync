@@ -28,9 +28,17 @@ Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
 
 - **Cadence:** redraws and the spinner animate at a steady 250 ms —
   smooth, low-CPU, no erratic spinner. Rendering is a small single-threaded
-  custom engine (not `indicatif`): the frame is anchored at the top of the
-  screen, cleared and rewritten as one unit, so finished bars never leave
-  stale lines behind.
+  custom engine (not `indicatif`): the frame is cleared and rewritten as
+  one unit, so bars never leave stale lines behind.
+- **Owns the screen while it runs:** the UI works on the terminal's
+  *alternate screen* — a dedicated page for the live frame. On finish,
+  error, Ctrl-C or SIGTERM (and even on a panic) psync restores the
+  primary screen, so finished bars never linger in your scrollback; the
+  final report and error messages print on your normal terminal.
+- **Modern colors:** 256-color styling — file bars fill with a blue→green
+  ramp, the grand total bar uses a brighter cyan ramp, names and messages
+  are dimmed for focus. Color turns off automatically when `NO_COLOR` is
+  set or `TERM=dumb`.
 - **Fits your terminal:** file names are center-ellipsized (`mid…dle`)
   so every line stays strictly inside the terminal width; on narrow
   terminals the speed drops out of the line. `--width COLS` overrides the
@@ -41,8 +49,9 @@ Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
 - **Units:** sizes default to the classic KB = 1024 B convention;
   `--si-units` switches to strict SI (kB = 1000 B) everywhere.
 - **One bar per active file** (at most `-j` at a time) plus one grand
-  total bar; skipped/hard-linked files count into the total instantly, so
-  an up-to-date run shows no bars at all.
+  total bar drawn at the *bottom* of the frame; skipped/hard-linked files
+  count into the total instantly, so an up-to-date run shows no bars at
+  all.
 
 ## Features
 
@@ -52,11 +61,13 @@ Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
 - **Parallel copies**: `-j/--jobs N` worker threads share one job queue; a
   single token-bucket pacer enforces the `--bwlimit` *total* rate, like rsync.
 - **Live progress** (custom single-threaded renderer): one bar per active
-  file (up to `-j` at a time) + a grand total bar, perfectly aligned
-  name/message columns, human-readable sizes/speeds, 250 ms smooth cadence,
-  `--si-units`, `--stats` summary, `--itemize-changes` (`*aiuc`-style
-  lines), `--log-file`. Warnings and phase messages coexist with the live
-  frame as persistent lines above it.
+  file (up to `-j` at a time) + a grand total bar at the bottom of the
+  frame, 256-color styling (auto-off with `NO_COLOR`), perfectly aligned
+  name/message columns, human-readable sizes/speeds, 250 ms smooth
+  cadence, `--si-units`, `--stats` summary, `--itemize-changes`
+  (`*aiuc`-style lines), `--log-file`. The UI works on the alternate
+  screen and hands the terminal back on every exit path. Warnings and
+  phase messages coexist with the live frame as persistent lines above it.
 - **Config mode**: `psync -C config.yaml` — drop-in replacement for
   **pybackupsync**: UUID-based drive mounting, per-destination `path`,
   `priority`, `compare` (size/sizeTime/timeSize/checksum), deletion policies
