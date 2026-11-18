@@ -6,12 +6,14 @@
 //!   one thread-safe UI (see `progress`). The crate is
 //!   `#![forbid(unsafe_code)]`,
 //!   so there are no raw pointers, no unsynchronized accesses, no races.
-//! * Jobs are pre-sorted by priority (pybackupsync scheduling: destination
-//!   priority, then destination uuid, then stable order), so parallel tasks
-//!   interleave nicely across drives. Each destination keeps its own task
-//!   bar showing its *full* progress (all its files, not just the current
-//!   one) while the bar message still names the file currently being
-//!   processed.
+//! * Jobs are pre-scheduled pybackupsync-style: each destination keeps its
+//!   own queue (plan order preserved), and within a priority tier (lower
+//!   value = runs first, default 99) destinations interleave round-robin —
+//!   one job per destination per pass, in scheduling order — so every
+//!   destination starts at the same time. Each destination keeps its own
+//!   task bar showing its *full* progress (all its files, not just the
+//!   current one) while the bar message still names the file currently
+//!   being processed.
 //! * Only **one job per destination** runs at a time (per-destination
 //!   mutex, keyed by the job's `task_id`): concurrent writes to the same
 //!   disk fragment files and stall spinning drives. This is how

@@ -16,7 +16,7 @@
 //!
 //! 1. No line is ever written exactly to the terminal's right edge, so the
 //!    cursor can never enter a pending-wrap state.
-//! 2. All terminal writes happen on one 250 ms ticker thread (plus the
+//! 2. All terminal writes happen on one 100 ms ticker thread (plus the
 //!    final frame), so frames can never interleave.
 //! 3. Each frame: home the cursor, redraw all lines, then clear
 //!    everything below the last line (`\x1b[J`). The frame is anchored at
@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 use crate::fsutil::{format_bytes, format_speed, Units};
 
 /// Steady redraw / spinner animation cadence: fluent and cheap.
-const TICK: Duration = Duration::from_millis(250);
+const TICK: Duration = Duration::from_millis(100);
 
 /// Spinner animation characters (as specified).
 const TICK_CHARS: [char; 4] = ['.', 's', 'S', 's'];
@@ -681,7 +681,7 @@ pub struct FileBar {
 
 impl FileBar {
     /// Report cumulative copied bytes. The value is stored (and the total
-    /// bar advances by the delta); the UI renders on its own 250 ms
+    /// bar advances by the delta); the UI renders on its own 100 ms
     /// cadence.
     pub fn report(&self, done: u64) {
         if self.inner.hidden {

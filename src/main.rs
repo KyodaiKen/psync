@@ -695,8 +695,18 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
         }
     }
 
-    // ---- jobs: (priority, destination, rel) ordering (pybackupsync parity)
-    let mut keyed: Vec<(u32, String, String, engine::Job)> = Vec::new();
+    // ---- jobs: pybackupsync-style scheduling.
+    // A flat (priority, destination, rel) sort would queue *all* of one
+    // destination's files before the next destination's, so with the
+    // per-destination lock the second destination could only start once
+    // the first destination's first file finished. Instead each
+    // destination keeps its own queue (plan order preserved) and
+    // destinations interleave round-robin within a priority tier
+    // (lower value = runs first, default 99): one job per destination
+    // per pass, in scheduling order. Every destination starts at the
+    // same time; one-job-per-destination stays enforced by the engine's
+    // per-destination locks.
+    let mut keyed: Vec<(u32, usize, String, engine::Job)> = Vec::new();
     for (di, dp) in dests.iter().enumerate() {
         for f in &dp.plan.files {
             let (verify, backup, link_to) = match &f.action {
@@ -709,7 +719,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             };
             keyed.push((
                 dp.priority,
-                dp.sort_key.clone(),
+                di,
                 f.rel.clone(),
                 engine::Job::File {
                     task_id: di,
@@ -732,7 +742,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
         for l in &dp.plan.links {
             keyed.push((
                 dp.priority,
-                dp.sort_key.clone(),
+                di,
                 l.rel.clone(),
                 engine::Job::Link {
                     task_id: di,
@@ -745,7 +755,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
         for n in &dp.plan.nodes {
             keyed.push((
                 dp.priority,
-                dp.sort_key.clone(),
+                di,
                 n.rel.clone(),
                 engine::Job::Node {
                     task_id: di,
@@ -757,10 +767,34 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             ));
         }
     }
-    keyed.sort_by(|a, b| {
-        (a.0, a.1.as_str(), a.2.as_str()).cmp(&(b.0, b.1.as_str(), b.2.as_str()))
-    });
-    let jobs: Vec<engine::Job> = keyed.into_iter().map(|t| t.3).collect();
+    let mut jobs: Vec<engine::Job> = Vec::new();
+    {
+        use std::collections::{BTreeMap, VecDeque};
+        let mut tier: BTreeMap<u32, Vec<(usize, VecDeque<engine::Job>)>> = BTreeMap::new();
+        for (pri, di, _rel, job) in keyed {
+            let cols = tier.entry(pri).or_default();
+            match cols.iter_mut().find(|(d, _)| *d == di) {
+                Some((_, q)) => q.push_back(job),
+                None => {
+                    let mut q = VecDeque::new();
+                    q.push_back(job);
+                    cols.push((di, q));
+                }
+            }
+        }
+        for (_, mut cols) in tier {
+            let mut any = true;
+            while any {
+                any = false;
+                for (_, q) in cols.iter_mut() {
+                    if let Some(j) = q.pop_front() {
+                        jobs.push(j);
+                        any = true;
+                    }
+                }
+            }
+        }
+    }
 
     let total_new_bytes: u64 = dests.iter().map(|d| d.plan.total_copy_bytes).sum();
     let nothing = jobs.is_empty();
