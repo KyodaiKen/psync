@@ -218,15 +218,28 @@ fn compute_layout(width: usize, units: Units, hints: &[(String, u64)], total: Op
             .map(|s| worst_msg(*s, units, compact).chars().count())
             .max()
             .unwrap_or_else(|| worst_msg(0, units, compact).chars().count());
-        let bar_w = 40usize.min(width / 3).max(10);
-        let name_w = longest_name
-            .min(width.saturating_sub(7 + bar_w + msg_w))
-            .max(4);
-        if 7 + bar_w + msg_w + name_w <= width {
+        let desired_bar = 40usize.min(width / 3).max(10);
+        // 1) The classic split, when it fits.
+        if longest_name + desired_bar + 7 + msg_w <= width {
+            return Layout {
+                width,
+                bar_w: desired_bar,
+                name_w: longest_name,
+                msg_w,
+                compact,
+            };
+        }
+        // 2) Long names (e.g. destination paths in config mode) get the
+        //    full width; the bar shrinks to a 10-cell floor instead.
+        let bar_min = 10usize;
+        if longest_name + bar_min + 7 + msg_w <= width {
+            let bar_w = (width - 7 - msg_w - longest_name)
+                .max(bar_min)
+                .min(desired_bar);
             return Layout {
                 width,
                 bar_w,
-                name_w,
+                name_w: longest_name,
                 msg_w,
                 compact,
             };

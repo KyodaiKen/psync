@@ -353,7 +353,15 @@ fn run_file(
     };
     let copy_target = staged.as_deref().unwrap_or(dst);
 
-    let fbar = ctx.ui.begin_file(rel, size);
+    let name = if ctx.show_dst_names {
+        // `dest-root/rel` with the run's shared prefix stripped, so
+        // concurrent copies to different destinations stay tell-apart
+        // even in a narrow name column.
+        EngineCtx::dst_display_name(&ctx.labels, dst, rel)
+    } else {
+        rel.to_string()
+    };
+    let fbar = ctx.ui.begin_file(&name, size);
     let on_chunk: fsutil::ChunkHook = {
         let fbar = fbar.clone();
         Box::new(move |done: u64| {

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
 use crate::fsutil::Pacer;
@@ -64,6 +64,10 @@ pub struct EngineCtx {
     pub dry_run: bool,
     /// Suffix for `--backup` files.
     pub suffix: String,
+    /// Show the *destination* file path on each progress line (config
+    /// mode: tells apart parallel copies to different destinations).
+    /// rsync mode shows the classic source-relative name instead.
+    pub show_dst_names: bool,
     /// Started at the beginning of the transfer phase.
     pub started: Instant,
 
@@ -86,12 +90,67 @@ pub struct EngineCtx {
 }
 
 impl EngineCtx {
+    /// Longest common *component-wise* prefix of the destination
+    /// labels ("" when they don't share one). Component-wise so that
+    /// `.../dest-a` and `.../dest-b` do not merge into a bogus prefix.
+    fn common_label_prefix(labels: &[String]) -> String {
+        if labels.is_empty() {
+            return String::new();
+        }
+        let mut rest: Vec<Vec<&str>> = labels.iter().map(|l| l.split('/').collect()).collect();
+        let mut out: Vec<&str> = Vec::new();
+        loop {
+            let head = rest[0].first().copied();
+            if head.is_none() || rest.iter().any(|c| c.first().copied() != head) {
+                break;
+            }
+            // Never swallow a one-component label whole.
+            if rest.iter().any(|c| c.len() <= 1) {
+                break;
+            }
+            out.push(head.unwrap());
+            for c in rest.iter_mut() {
+                c.remove(0);
+            }
+        }
+        out.join("/")
+    }
+
+    /// Progress-line name for a copied file when destination identity
+    /// matters (config mode): the destination root with the prefix
+    /// shared by all destinations of this run stripped, plus the file's
+    /// relative path — e.g. `dest-a/data/archive.tar.gz` vs
+    /// `dest-b/mirror/data/archive.tar.gz`. Falls back to the plain
+    /// relative path when the root would be empty (single destination),
+    /// or to the full destination path if it matches no label.
+    pub fn dst_display_name(labels: &[String], dst: &Path, rel: &str) -> String {
+        let prefix = Self::common_label_prefix(labels);
+        for l in labels {
+            if dst.starts_with(l.as_str()) {
+                let root = if prefix.is_empty() {
+                    l.clone()
+                } else {
+                    l.strip_prefix(prefix.as_str())
+                        .unwrap_or(l.as_str())
+                        .trim_start_matches('/')
+                        .to_string()
+                };
+                if root.is_empty() {
+                    return rel.to_string();
+                }
+                return format!("{root}/{rel}");
+            }
+        }
+        dst.display().to_string()
+    }
+
     pub fn new(
         ui: Arc<ProgressUi>,
         labels: Vec<String>,
         pacer: Option<Mutex<Pacer>>,
         dry_run: bool,
         suffix: String,
+        show_dst_names: bool,
     ) -> Self {
         Self {
             ui,
@@ -99,6 +158,7 @@ impl EngineCtx {
             pacer,
             dry_run,
             suffix,
+            show_dst_names,
             started: Instant::now(),
             copied_bytes: AtomicU64::new(0),
             copied_files: AtomicU64::new(0),

@@ -365,6 +365,7 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
         pacer,
         false,
         cli.suffix.clone().unwrap_or_else(|| "~".into()),
+        false,
     ));
 
     // Deletion phase: before (also --delete-during, rsync-like).
@@ -780,11 +781,17 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     // ---- progress: one bar per active file (workers open them as they
     // go) + one grand total bar. The file set is known now, so the name
     // and message columns are fixed for the whole run.
+    let pacer = cli.bwlimit_kib().map(|k| Mutex::new(fsutil::Pacer::new(k)));
+    let labels: Vec<String> = dests.iter().map(|d| d.label.clone()).collect();
     if total_new_bytes > 0 {
         let hints: Vec<(String, u64)> = jobs
             .iter()
             .filter_map(|j| match j {
-                engine::Job::File { rel, size, .. } => Some((rel.clone(), *size)),
+                // Config mode names the *destination* file (shared prefix
+                // stripped), so each line shows which copy it is.
+                engine::Job::File { dst, rel, size, .. } => {
+                    Some((EngineCtx::dst_display_name(&labels, dst, rel), *size))
+                }
                 _ => None,
             })
             .collect();
@@ -793,9 +800,7 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
     }
 
     // ---- engine
-    let pacer = cli.bwlimit_kib().map(|k| Mutex::new(fsutil::Pacer::new(k)));
-    let labels: Vec<String> = dests.iter().map(|d| d.label.clone()).collect();
-    let ctx = Arc::new(EngineCtx::new(ui.clone(), labels, pacer, false, "~".into()));
+    let ctx = Arc::new(EngineCtx::new(ui.clone(), labels, pacer, false, "~".into(), true));
 
     ui.println(&format!(
         "Starting Copy. Total data: {}",

@@ -46,6 +46,12 @@ Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
 - **Perfectly aligned columns:** the name and message column widths are
   computed once from the *whole* planned file set, so every job's line has
   identical column widths and the ellipsis fits exactly.
+- **Config mode names the destination:** with several destinations,
+  each progress line is shown as `dest-root/relative/path` (the prefix
+  shared by all destinations of the run is stripped), so you always see
+  which copy is which — e.g. `dest-a/data/archive.tar.gz` vs
+  `dest-b/mirror/data/archive.tar.gz`. rsync mode keeps the classic
+  source-relative names.
 - **Units:** sizes default to the classic KB = 1024 B convention;
   `--si-units` switches to strict SI (kB = 1000 B) everywhere.
 - **One bar per active file** (at most `-j` at a time) plus one grand
