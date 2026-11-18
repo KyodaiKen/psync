@@ -29,10 +29,12 @@
 //!    shell prompt, scrollback, and the summary lines always land on the
 //!    main page.
 //!
-//! Look: modern 256-color styling — the bar fill rides a blue → green
-//! ramp that drifts across the bar as it fills (grand total: a brighter
-//! cyan ramp), with muted gray text; disabled automatically by `NO_COLOR`
-//! or `TERM=dumb`.
+//! Look: modern 256-color styling — the bar fill is a smooth blue →
+//! cyan → green sweep (each neighbor one cube step apart, so the
+//! gradient can't patch or jump on any palette), pinned to bar position
+//! so it reveals stably as the bar fills; the grand total bar uses the
+//! brighter half of the same path. Muted gray text; disabled
+//! automatically by `NO_COLOR` or `TERM=dumb`.
 //!
 //! Layout: one live line per active file plus one grand-total line. The
 //! name (prefix) column and the message column have fixed widths computed
@@ -64,12 +66,13 @@ const TICK_CHARS: [char; 4] = ['.', 's', 'S', 's'];
 /// Bar fill characters, 8 sub-cells to blank (as specified).
 const BAR_CHARS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
-/// Blue → green ramp for the bar fill (256-color indices): the hue drifts
-/// across the bar as it fills.
-const FILL_RAMP: [u8; 18] = [21, 22, 23, 24, 33, 34, 36, 38, 40, 42, 44, 46, 48, 52, 58, 66, 76, 84];
+/// Blue → cyan → green ramp for the bar fill (256-color cube indices):
+/// each step moves exactly one axis by one level, so the gradient is
+/// smooth in every palette — and R stays 0, so nothing can render red.
+const FILL_RAMP: [u8; 11] = [21, 27, 33, 39, 45, 51, 50, 49, 48, 47, 46];
 
-/// Brighter cyan ramp for the grand-total bar.
-const TOTAL_RAMP: [u8; 8] = [81, 82, 83, 84, 85, 86, 87, 87];
+/// The brighter half of the same path, for the grand-total bar.
+const TOTAL_RAMP: [u8; 8] = [33, 39, 45, 51, 50, 49, 48, 47];
 
 /// Muted colors (256-color indices).
 const COL_NAME: u8 = 252;
@@ -79,6 +82,15 @@ const COL_BAR_EMPTY: u8 = 236;
 const COL_BRACKET: u8 = 238;
 const COL_SPINNER: u8 = 87;
 const COL_WARNING: u8 = 214;
+
+/// Whether ANSI 256-color output is enabled for this process (a TTY,
+/// no `NO_COLOR`, and `TERM` other than `dumb`). Shared by the live UI
+/// and the final report so both always agree.
+pub fn color_enabled() -> bool {
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").map(|v| v.as_os_str().is_empty()).unwrap_or(true)
+        && std::env::var_os("TERM").map(|t| t != "dumb").unwrap_or(true)
+}
 
 /// ETAs longer than this are capped (keeps the message width bounded).
 const MAX_ETA_SECS: u64 = 9 * 3600 + 59 * 60;
@@ -355,7 +367,7 @@ impl BarState {
 
 struct State {
     /// Persistent text lines (warnings, notes) shown above the live frame.
-    orphans: Vec<String>,
+    orphans: Vec<(String, bool)>,
     /// Phase spinner (scan/delete), shown alone while it runs.
     spinner: Option<(String, String)>,
     total: Option<BarState>,
@@ -400,10 +412,14 @@ impl Inner {
         let layout = s.layout;
         let tick = TICK_CHARS[s.tick % TICK_CHARS.len()];
         let mut lines: Vec<String> = Vec::new();
-        for o in &s.orphans {
+        for (o, warn) in &s.orphans {
             let l: String = o.chars().take(layout.width.saturating_sub(1)).collect();
             lines.push(if color {
-                format!("\x1b[1;38;5;{COL_WARNING}m{l}\x1b[0m")
+                if *warn {
+                    format!("\x1b[1;38;5;{COL_WARNING}m{l}\x1b[0m")
+                } else {
+                    format!("\x1b[38;5;{COL_MSG}m{l}\x1b[0m")
+                }
             } else {
                 l
             });
@@ -460,7 +476,11 @@ fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units, color: bool,
             // Filled cells ride the blue→green ramp (position-scaled across
             // the filled span); empty cells stay dark.
             let col = if i <= full {
-                ramp[(i * (ramp.len() - 1) / full.max(1)).min(ramp.len() - 1)]
+                // A fully filled bar ends exactly on the ramp's final
+                // color (pure green) instead of one step short.
+                let idx = i * (ramp.len() - 1) / layout.bar_w.max(1);
+                let idx = if i == layout.bar_w - 1 { ramp.len() - 1 } else { idx };
+                ramp[idx]
             } else {
                 COL_BAR_EMPTY
             };
@@ -670,9 +690,7 @@ impl ProgressUi {
     /// `width_override` forces the terminal width (for testing).
     pub fn new(units: Units, width_override: Option<usize>) -> Arc<Self> {
         let hidden = !std::io::stdout().is_terminal();
-        let color = !hidden
-            && std::env::var_os("NO_COLOR").map(|v| v.as_os_str().is_empty()).unwrap_or(true)
-            && std::env::var_os("TERM").map(|t| t != "dumb").unwrap_or(true);
+        let color = color_enabled();
         let width = width_override.unwrap_or_else(term_width).max(20);
         let state = State {
             orphans: Vec::new(),
@@ -825,7 +843,23 @@ impl ProgressUi {
         };
         if !self.inner.hidden && active {
             let mut s = self.inner.state();
-            s.orphans.push(text.to_string());
+            s.orphans.push((text.to_string(), false));
+            self.inner.wait.notify_all();
+        } else {
+            eprintln!("{text}");
+        }
+    }
+
+    /// Like `println`, but the line is a *warning* (bold amber in the
+    /// live frame; identical plain text when the UI is inactive).
+    pub fn warn(&self, text: &str) {
+        let active = {
+            let s = self.inner.state();
+            s.ui_started && !s.finished
+        };
+        if !self.inner.hidden && active {
+            let mut s = self.inner.state();
+            s.orphans.push((text.to_string(), true));
             self.inner.wait.notify_all();
         } else {
             eprintln!("{text}");

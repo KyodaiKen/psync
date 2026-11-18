@@ -15,6 +15,7 @@
 use std::io::Write;
 
 use crate::fsutil::{format_bytes, format_speed, Units};
+use crate::progress;
 
 #[derive(Debug, Clone)]
 pub struct ItemizeLine {
@@ -57,37 +58,52 @@ pub struct Summary {
 
 impl Summary {
     pub fn render(&self) -> String {
-        let mut s = String::new();
+        let color = progress::color_enabled();
         let size = |n: u64| format_bytes(n, self.units);
-        s.push_str(&format!("Number of files scanned:          {:>8}\n", self.files_scanned));
-        s.push_str(&format!("Number of files transferred:      {:>8}\n", self.copied_files));
-        s.push_str(&format!("Total transferred file size:      {:>8}\n", size(self.copied_bytes)));
+        let mut rows: Vec<(&str, String)> = Vec::new();
+        rows.push(("Number of files scanned", self.files_scanned.to_string()));
+        rows.push(("Number of files transferred", self.copied_files.to_string()));
+        rows.push(("Total transferred file size", size(self.copied_bytes)));
         if self.linked_files > 0 {
-            s.push_str(&format!("Number of files hard-linked:      {:>8}\n", self.linked_files));
+            rows.push(("Number of files hard-linked", self.linked_files.to_string()));
         }
-        s.push_str(&format!("Skipped files:                    {:>8}\n", self.skipped_files));
+        rows.push(("Skipped files", self.skipped_files.to_string()));
         if self.deleted_files > 0 {
-            s.push_str(&format!("Number of files deleted:        {:>8}\n", self.deleted_files));
-            s.push_str(&format!("Total deleted file size:        {:>8}\n", size(self.deleted_bytes)));
+            rows.push(("Number of files deleted", self.deleted_files.to_string()));
+            rows.push(("Total deleted file size", size(self.deleted_bytes)));
         }
         if self.error_files > 0 {
-            s.push_str(&format!("Errors encountered:             {:>8}\n", self.error_files));
+            rows.push(("Errors encountered", self.error_files.to_string()));
         }
         if self.cancelled_jobs > 0 {
-            s.push_str(&format!("Cancelled jobs:                 {:>8}\n", self.cancelled_jobs));
+            rows.push(("Cancelled jobs", self.cancelled_jobs.to_string()));
         }
-        s.push_str(&format!(
-            "Total execution time:             {:>10.2} s\n",
-            self.elapsed_secs
-        ));
+        rows.push(("Total execution time", format!("{:.2} s", self.elapsed_secs)));
         if self.elapsed_secs > 0.0 {
             let avg = self.copied_bytes as f64 / self.elapsed_secs;
-            s.push_str(&format!(
-                "Average transfer speed:         {:>12}\n",
-                format_speed(avg, self.units)
-            ));
+            rows.push(("Average transfer speed", format_speed(avg, self.units)));
+        }
+        let mut s = String::new();
+        for (label, value) in rows {
+            s.push_str(&row(label, &value, color));
+            s.push('\n');
         }
         s
+    }
+}
+
+/// One summary row: `Label .... : value` — the dot leader keeps the colon
+/// (and therefore every value) on a fixed column. Colored to match the
+/// live UI; plain when colors are off.
+fn row(label: &str, value: &str, color: bool) -> String {
+    const COLON_COL: usize = 35; // 0-based column where ':' sits
+    let dots = ".".repeat(COLON_COL.saturating_sub(label.len() + 2).max(2));
+    if color {
+        format!(
+            "\x1b[38;5;250m{label}\x1b[0m  \x1b[38;5;236m{dots}\x1b[0m : \x1b[1;38;5;255m{value}\x1b[0m"
+        )
+    } else {
+        format!("{label}  {dots} : {value}")
     }
 }
 

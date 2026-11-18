@@ -118,7 +118,8 @@ impl EngineCtx {
     pub fn add_warning(&self, msg: String) {
         // Routed through the UI so the line coexists with the live frame
         // (while it runs) and prints plainly otherwise (dry runs, errors).
-        self.ui.println(&format!("warning: {msg}"));
+        // Warnings get their own bold-amber styling in the live frame.
+        self.ui.warn(&format!("warning: {msg}"));
         self.warnings
             .lock()
             .unwrap_or_else(|p| p.into_inner())
