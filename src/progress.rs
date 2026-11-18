@@ -614,15 +614,20 @@ fn render_frame(inner: &Inner, final_frame: bool) {
         if anchored {
             out.push_str("\x1b[H");
         }
-        for (i, line) in lines.iter().enumerate() {
-            if i > 0 {
-                out.push('\n');
-            }
+        for line in lines.iter() {
+            // Erase the line first: a line can be *shorter* than the line
+            // that occupied this row in a taller previous frame (the
+            // frame grows as persistent lines are added), and a plain
+            // overwrite would leave the stale tail on screen.
+            out.push_str("\x1b[2K");
             out.push_str(line);
+            out.push('\n');
         }
-        // Wipe any leftover below the frame: lines from a taller previous
-        // frame (a finished bar, wrapped fragments) never survive.
-        out.push_str("\r\x1b[2K\x1b[J");
+        // Cursor now sits on the blank line below the frame: wipe
+        // everything further down (rows of a taller previous frame never
+        // survive). The last drawn line itself is safe: it was fully
+        // erased before being redrawn.
+        out.push_str("\x1b[J");
     }
     let _wl = inner.write_lock.lock().unwrap_or_else(|p| p.into_inner());
     let mut err = std::io::stderr();
