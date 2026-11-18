@@ -519,7 +519,9 @@ fn bar_line(layout: Layout, tick: char, b: &BarState, units: Units, color: bool,
         bar.push_str("\x1b[0m");
     }
     let pct = if b.size == 0 {
-        0.0
+        // A zero-byte total (nothing to copy) is complete, matching the
+        // full bar drawn for it.
+        100.0
     } else {
         (done as f64 * 100.0 / b.size as f64).min(100.0)
     };
@@ -822,10 +824,11 @@ impl ProgressUi {
         self.inner.hidden
     }
 
-    /// The grand total bar (call once with the planned byte count; skip
-    /// when nothing will be copied — no stray bar).
+    /// The grand total bar (call once with the planned byte count).
+    /// Always created — even for a zero-byte (no-op) run, which then
+    /// shows the total at 100% ("0 B/0 B") instead of a bare frame.
     pub fn begin_total(&self, label: &str, total_bytes: u64) {
-        if self.inner.hidden || total_bytes == 0 {
+        if self.inner.hidden {
             return;
         }
         {

@@ -346,8 +346,10 @@ fn run_rsync_mode(cli: &Cli) -> Result<i32> {
     }
 
     // Grand total bar (one bar per active file is opened by the workers
-    // as they go). Skipped when nothing will be copied — no stray bar.
-    if plan.total_copy_bytes > 0 {
+    // as they go). Created even when nothing will be copied, so a no-op
+    // run still shows the total bar — instantly at 100% — instead of a
+    // bare frame.
+    {
         let hints: Vec<(String, u64)> = plan
             .files
             .iter()
@@ -796,8 +798,10 @@ fn run_config_mode(cli: &Cli) -> Result<i32> {
             })
             .collect();
         ui.set_file_hints(&hints);
-        ui.begin_total("total", total_new_bytes);
     }
+    // The total bar always exists — even a no-op run shows it at 100%
+    // ("0 B/0 B") so the frame never degenerates to bare text lines.
+    ui.begin_total("total", total_new_bytes);
 
     // ---- engine
     let ctx = Arc::new(EngineCtx::new(ui.clone(), labels, pacer, false, "~".into(), true));
