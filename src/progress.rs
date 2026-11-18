@@ -25,7 +25,7 @@
 //! Layout: one live line per active file plus one grand-total line. The
 //! name (prefix) column and the message column have fixed widths computed
 //! once from the whole planned file set, so every job's line lines up
-//! perfectly; long names are front-ellipsized to exactly that width.
+//! perfectly; long names are center-ellipsized to exactly that width.
 //!
 //! ```text
 //! . photos/cat.jpg      [████████▌     ] 1.2 GB/4.5 GB (27%) 412 MB/s ETA 9s
@@ -49,7 +49,7 @@ const TICK: Duration = Duration::from_millis(250);
 const TICK_CHARS: [char; 4] = ['.', 's', 'S', 's'];
 
 /// Bar fill characters, 8 sub-cells to blank (as specified).
-const BAR_CHARS: [char; 9] = ['█', '▉', '▊', '▋', '▌', '▍', '▎', '▏', ' '];
+const BAR_CHARS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
 /// ETAs longer than this are capped (keeps the message width bounded).
 const MAX_ETA_SECS: u64 = 9 * 3600 + 59 * 60;
@@ -175,20 +175,67 @@ fn compute_layout(width: usize, units: Units, hints: &[(String, u64)], total: Op
     }
 }
 
-/// Front-ellipsize `name` to exactly `w` chars (keep the tail), or left-pad
-/// it with spaces when it is shorter — the column always lands at the same
-/// position.
+/// Display width of one character: wide (CJK, fullwidth, emoji) characters
+/// occupy two terminal cells, everything else one. (`char::width` is not
+/// yet stabilized on this toolchain.)
+fn char_width(c: char) -> usize {
+    if ('\u{1100}'..='\u{115F}').contains(&c)
+        || ('\u{2E80}'..='\u{33FF}').contains(&c)
+        || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        || ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        || ('\u{A000}'..='\u{A4CF}').contains(&c)
+        || ('\u{AC00}'..='\u{D7A3}').contains(&c)
+        || ('\u{F900}'..='\u{FAFF}').contains(&c)
+        || ('\u{FE30}'..='\u{FE4F}').contains(&c)
+        || ('\u{FF00}'..='\u{FF60}').contains(&c)
+        || ('\u{FFE0}'..='\u{FFDF}').contains(&c)
+        || ('\u{1F300}'..='\u{1FAFF}').contains(&c)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+/// Fit `name` into exactly `w` columns: center-ellipsize long names
+/// (`mid…dle`), or right-pad shorter ones with spaces — the column always
+/// ends at the same position.
 fn fit_name(name: &str, w: usize) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    if chars.len() <= w {
+    let chs: Vec<char> = name.chars().collect();
+    let total_w: usize = chs.iter().map(|c| char_width(*c)).sum();
+    if total_w <= w {
         let mut s = name.to_string();
-        s.push_str(&" ".repeat(w - chars.len()));
+        s.push_str(&" ".repeat(w - total_w));
         s
-    } else if w <= 1 {
+    } else if w == 0 {
+        String::new()
+    } else if w == 1 {
         "…".to_string()
     } else {
-        let tail: String = chars[chars.len() - w + 1..].iter().collect();
-        format!("…{tail}")
+        // Reserve one column for the ellipsis; split the rest head/tail.
+        let avail = w - 1;
+        let half = avail / 2;
+        let mut head = String::new();
+        let mut hw = 0;
+        for &c in &chs {
+            let cw = char_width(c);
+            if hw + cw > half {
+                break;
+            }
+            head.push(c);
+            hw += cw;
+        }
+        let mut tail = String::new();
+        let mut tw = 0;
+        for &c in chs.iter().rev() {
+            let cw = char_width(c);
+            if tw + cw > avail - hw {
+                break;
+            }
+            tail.insert(0, c);
+            tw += cw;
+        }
+        format!("{head}…{tail}")
     }
 }
 

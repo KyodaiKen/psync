@@ -31,7 +31,7 @@ Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
   custom engine (not `indicatif`): the frame is anchored at the top of the
   screen, cleared and rewritten as one unit, so finished bars never leave
   stale lines behind.
-- **Fits your terminal:** file names are front-ellipsized (`…tail.bin`)
+- **Fits your terminal:** file names are center-ellipsized (`mid…dle`)
   so every line stays strictly inside the terminal width; on narrow
   terminals the speed drops out of the line. `--width COLS` overrides the
   detected width (for testing).
