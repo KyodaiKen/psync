@@ -18,10 +18,18 @@
 //!    cursor can never enter a pending-wrap state.
 //! 2. All terminal writes happen on one 250 ms ticker thread (plus the
 //!    final frame), so frames can never interleave.
-//! 3. Each frame: move up `prev_lines` lines, clear them top-to-bottom,
-//!    then rewrite the frame's lines. Unambiguous when every line is
-//!    shorter than the terminal width.
-//! 4. The first frame enters the terminal's *alternate screen buffer*
+//! 3. Each frame: home the cursor, redraw all lines, then clear
+//!    everything below the last line (`\x1b[J`). The frame is anchored at
+//!    the top of the alternate screen, so this wipes the whole previous
+//!    frame — even parts a relative up/down walk would have missed (a
+//!    wrapped line from a stale layout, a terminal resize mid-run) — and
+//!    a finished bar's line can never be left behind.
+//! 4. The layout keeps the invariant `name + bar + msg + fixed <= width`:
+//!    the bar holds its healthy width and long names are
+//!    center-ellipsized instead; a line wider than the terminal wraps,
+//!    and that wrapping is exactly what used to strand ghost lines. The
+//!    layout is recomputed if the terminal is resized during a run.
+//! 5. The first frame enters the terminal's *alternate screen buffer*
 //!    (the vim/less-style "next page"); `finish_all` — or the death of the
 //!    process itself (SIGKILL included: modern terminals restore the
 //!    primary screen when the foreground program exits, and a panic hook
@@ -218,28 +226,33 @@ fn compute_layout(width: usize, units: Units, hints: &[(String, u64)], total: Op
             .map(|s| worst_msg(*s, units, compact).chars().count())
             .max()
             .unwrap_or_else(|| worst_msg(0, units, compact).chars().count());
-        let desired_bar = 40usize.min(width / 3).max(10);
-        // 1) The classic split, when it fits.
-        if longest_name + desired_bar + 7 + msg_w <= width {
+        let desired_bar = (width / 3).clamp(10, 40);
+        // The bar keeps its healthy width; the name column gets the rest
+        // (center-ellipsized when the path is long). The invariant that
+        // matters most is `name_w + bar_w + msg_w + 7 <= width` — a line
+        // wider than the terminal wraps, and a wrapped frame is what
+        // strands uncleared fragments on screen.
+        let name_room = width.saturating_sub(7 + msg_w + desired_bar);
+        if name_room >= 10 {
+            let name_w = longest_name.min(name_room);
+            let bar_w = desired_bar.min(width - 7 - msg_w - name_w);
             return Layout {
                 width,
-                bar_w: desired_bar,
-                name_w: longest_name,
+                bar_w,
+                name_w,
                 msg_w,
                 compact,
             };
         }
-        // 2) Long names (e.g. destination paths in config mode) get the
-        //    full width; the bar shrinks to a 10-cell floor instead.
-        let bar_min = 10usize;
-        if longest_name + bar_min + 7 + msg_w <= width {
-            let bar_w = (width - 7 - msg_w - longest_name)
-                .max(bar_min)
-                .min(desired_bar);
+        // Narrow terminal: the bar drops to its floor, the name keeps a
+        // useful minimum and is ellipsized to fit.
+        let bar_w = 10usize;
+        let name_w = longest_name.min(width.saturating_sub(7 + msg_w + bar_w));
+        if name_w >= 6 && name_w + bar_w + msg_w + 7 <= width {
             return Layout {
                 width,
                 bar_w,
-                name_w: longest_name,
+                name_w,
                 msg_w,
                 compact,
             };
@@ -389,15 +402,13 @@ struct State {
     hints: Vec<(String, u64)>,
     /// Global tick counter (drives the spinner characters).
     tick: usize,
-    /// Lines of the previously rendered frame (incl. orphans).
-    prev_lines: usize,
     /// True once any spinner/bar has been started (for `println` routing).
     ui_started: bool,
     /// True after the final frame has been rendered.
     finished: bool,
     /// True once the frame has been anchored at the top of the screen
-    /// (first non-empty frame clears the screen and draws at line 0, so
-    /// frame growth can never scroll the screen and strand top lines).
+    /// (first non-empty frame takes over the alternate screen and draws
+    /// at line 0, so the home/redraw/clear-below protocol always applies).
     anchored: bool,
 }
 
@@ -408,6 +419,8 @@ struct Inner {
     hidden: bool,
     /// Color output (ANSI 256-color), off for NO_COLOR / TERM=dumb / pipes.
     color: bool,
+    /// Forced terminal width (tests); `None` = probe the real terminal.
+    width_override: Option<usize>,
     /// Set when the UI must stop ticking.
     stop: AtomicBool,
     /// Serializes the actual terminal writes (ticker vs final frame).
@@ -548,10 +561,13 @@ fn pad_to(s: &str, w: usize) -> String {
     }
 }
 
-/// Render one frame: clear the previous frame's lines (top-to-bottom), then
-/// write the new lines. Every line is shorter than the terminal width, so
-/// the cursor can never be in a pending-wrap state and the up/clear/down
-/// dance is unambiguous on any terminal.
+/// Render one frame. The frame is always anchored at the top of the
+/// alternate screen, so each render simply homes the cursor, redraws all
+/// lines, and clears everything below the last one. This is robust against
+/// anything that desyncs a relative up/down cursor dance (terminal resize,
+/// a wrapped line from a stale layout, a missed escape): the previous
+/// frame — even parts of it the relative walk would have missed — is
+/// always wiped, so a finished bar's line can never be left behind.
 fn render_frame(inner: &Inner, final_frame: bool) {
     if inner.hidden {
         return;
@@ -567,42 +583,45 @@ fn render_frame(inner: &Inner, final_frame: bool) {
             for f in &mut s.files {
                 f.update_rate(now);
             }
+            // Terminal resized during the run: recompute the layout so
+            // every line still fits inside the (new) width — a too-wide
+            // line wraps, and that is what strands uncleared fragments.
+            let w = inner
+                .width_override
+                .unwrap_or_else(|| terminal_size::terminal_size().map(|(w, _)| w.0 as usize).unwrap_or(80))
+                .max(20);
+            if w != s.layout.width {
+                s.layout = compute_layout(w, inner.units, &s.hints, s.total.as_ref().map(|t| t.size));
+            }
         }
         Inner::frame_lines(&s, inner.units, inner.color)
     };
 
-    let prev = inner.state().prev_lines;
     let anchored = inner.state().anchored;
     let mut out = String::new();
     if !anchored && !lines.is_empty() {
         // First frame: take over the terminal's *alternate* screen
         // (vim/less-style). The primary screen and its scrollback are left
         // completely untouched; on finish — or when the process dies,
-        // however it dies — we (or the terminal) return to it. Clearing +
-        // homing the fresh screen also keeps the invariant "frame top at
-        // line 0", so growth never scrolls and no line can be stranded.
+        // however it dies — we (or the terminal) return to it. The fresh
+        // screen starts blank and the frame is anchored at line 0.
         out.push_str("\x1b[?1049h");
         enter_alt_screen();
-    } else if prev > 0 {
-        out.push_str(&format!("\x1b[{prev}A"));
-        for i in 0..prev {
-            out.push_str("\r\x1b[2K");
-            if i + 1 < prev {
-                out.push_str("\x1b[1B");
+    }
+    if !lines.is_empty() || anchored {
+        if anchored {
+            out.push_str("\x1b[H");
+        }
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
             }
+            out.push_str(line);
         }
-        if prev > 1 {
-            out.push_str(&format!("\x1b[{}A", prev - 1));
-        }
+        // Wipe any leftover below the frame: lines from a taller previous
+        // frame (a finished bar, wrapped fragments) never survive.
+        out.push_str("\r\x1b[2K\x1b[J");
     }
-    for (i, line) in lines.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-    let n = lines.len();
-
     let _wl = inner.write_lock.lock().unwrap_or_else(|p| p.into_inner());
     let mut err = std::io::stderr();
     if let Err(e) = err.write_all(out.as_bytes()) {
@@ -615,7 +634,6 @@ fn render_frame(inner: &Inner, final_frame: bool) {
     drop(_wl);
 
     let mut s = inner.state();
-    s.prev_lines = n;
     s.anchored = s.anchored || !lines.is_empty();
     if final_frame {
         s.finished = true;
@@ -755,7 +773,6 @@ impl ProgressUi {
             layout: compute_layout(width, units, &[], None),
             hints: Vec::new(),
             tick: 0,
-            prev_lines: 0,
             ui_started: false,
             finished: false,
             anchored: false,
@@ -766,6 +783,7 @@ impl ProgressUi {
             units,
             hidden,
             color,
+            width_override,
             stop: AtomicBool::new(false),
             write_lock: Mutex::new(()),
             ticker: Mutex::new(None),
