@@ -427,8 +427,17 @@ fn run_file(
     let fbar = ctx.ui.begin_file(&name, size);
     let on_chunk: fsutil::ChunkHook = {
         let fbar = fbar.clone();
-        Box::new(move |done: u64| {
+        Arc::new(move |done: u64| {
             fbar.report(done);
+            true
+        })
+    };
+    // Feeds the bar while the final fsync blocks: honest crawl at flush
+    // speed (the watermark is already capped at the file size upstream).
+    let on_flush_tick: fsutil::ChunkHook = {
+        let fbar = fbar.clone();
+        Arc::new(move |w: u64| {
+            fbar.report(w);
             true
         })
     };
@@ -440,6 +449,7 @@ fn run_file(
         src_meta,
         keep_partial,
         on_chunk,
+        on_flush_tick: Some(on_flush_tick),
     };
 
     match fsutil::copy_file(src, copy_target, &copy_ctx, &ctx.pacer) {

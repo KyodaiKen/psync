@@ -30,6 +30,12 @@ Bars use your glyph style: `progress_chars("█▉▊▋▌▍▎▏ ")` with
   smooth, low-CPU, no erratic spinner. Rendering is a small single-threaded
   custom engine (not `indicatif`): the frame is cleared and rewritten as
   one unit, so bars never leave stale lines behind.
+- **Honest progress:** a bar tracks data the kernel has actually written
+  to the device (the `/proc/self/io` counter), not just page cache — so
+  the final stretch crawls to 100% at the real flush speed instead of
+  freezing near 99.9%, and 100% lands only once `fsync` has succeeded.
+  `PSYNC_PROGRESS_NO_DEVIO=1` falls back to the classic page-cache
+  progress.
 - **Owns the screen while it runs:** the UI works on the terminal's
   *alternate screen* — a dedicated page for the live frame. On finish,
   error, Ctrl-C or SIGTERM (and even on a panic) psync restores the

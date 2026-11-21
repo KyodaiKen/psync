@@ -11,6 +11,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -201,10 +204,12 @@ impl Pacer {
 }
 
 /// Callback invoked by [`copy_file`] after each chunk is written.
-/// Receives the cumulative number of bytes written; return `false` to abort
-/// the transfer (the partial destination file is removed unless
-/// [`CopyCtx::keep_partial`] is set).
-pub type ChunkHook = Box<dyn Fn(u64) -> bool>;
+/// Receives the cumulative honest progress for the file (see the progress
+/// semantics on [`copy_file`]); return `false` to abort the transfer (the
+/// partial destination file is removed unless [`CopyCtx::keep_partial`] is
+/// set). `Arc` so the same callback can be shared with the flush-tick
+/// thread.
+pub type ChunkHook = Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
 /// Context for a single file copy.
 pub struct CopyCtx {
@@ -220,6 +225,11 @@ pub struct CopyCtx {
     pub keep_partial: bool,
     /// Progress callback.
     pub on_chunk: ChunkHook,
+    /// Optional callback ticked while the final `fsync` is in flight, with
+    /// the device-side watermark (bytes actually on the device so far,
+    /// capped at the file size): keeps the progress bar crawling during the
+    /// flush instead of freezing. Return `false` to stop ticking.
+    pub on_flush_tick: Option<ChunkHook>,
 }
 
 impl CopyCtx {
@@ -231,9 +241,99 @@ impl CopyCtx {
     }
 }
 
+/// How far into the page cache a file may be before a frozen
+/// `/proc/self/io` counter is declared broken and progress reporting falls
+/// back to page-cache progress (256 MiB).
+const DEVIO_FALLBACK_AFTER: u64 = 256 * 1024 * 1024;
+
+/// Device-side progress tracking via the `write_bytes` counter of Linux's
+/// `/proc/self/io`: the bytes the kernel has actually written to the
+/// storage device on behalf of this process.
+///
+/// Progress is clamped to this watermark, so a bar reflects data that has
+/// *landed* rather than data merely sitting in the page cache: during the
+/// final `fsync` the bar keeps crawling at the real flush speed and only
+/// reaches 100% once the device has really accepted the data.
+///
+/// The counter is process-wide, so parallel copies can push it ahead; the
+/// clamp to a file's own written bytes keeps every file's bar honest (it
+/// can never overtake its own progress).
+///
+/// If the counter never advances (kernel without io accounting, or a
+/// device that never accepted a byte), reporting falls back to page-cache
+/// progress after a grace period so a bar never freezes at 0%.
+#[derive(Debug)]
+struct DevioTracker {
+    /// `write_bytes` when the copy started (the counter is process-wide, so
+    /// only deltas make sense).
+    base: u64,
+    /// Highest delta observed so far (monotonic).
+    watermark: u64,
+    /// Set once the counter is declared broken (frozen at 0 past the grace
+    /// period): report page-cache progress from then on.
+    disabled: bool,
+}
+
+impl DevioTracker {
+    fn new() -> Option<Self> {
+        // Escape hatch / A/B switch for the old (page-cache) behavior.
+        if std::env::var_os("PSYNC_PROGRESS_NO_DEVIO").map(|v| !v.is_empty()).unwrap_or(false) {
+            return None;
+        }
+        Some(Self {
+            base: device_write_bytes()?,
+            watermark: 0,
+            disabled: false,
+        })
+    }
+
+    /// Fold in a fresh `write_bytes` reading (the watermark is monotonic).
+    fn observe(&mut self, write_bytes: Option<u64>) {
+        if let Some(cur) = write_bytes {
+            let delta = cur.saturating_sub(self.base);
+            if delta > self.watermark {
+                self.watermark = delta;
+            }
+        }
+    }
+
+    /// Honest progress for `written` bytes accepted into the page cache.
+    fn honest(&mut self, written: u64) -> u64 {
+        if self.disabled {
+            return written;
+        }
+        if self.watermark == 0 && written >= DEVIO_FALLBACK_AFTER {
+            // Frozen at 0 despite a lot of writes: the counter is not
+            // accounting (or the device never accepted a byte) — report
+            // what we know, the page-cache side.
+            self.disabled = true;
+            return written;
+        }
+        written.min(self.watermark)
+    }
+}
+
+/// Bytes the kernel has written to the device on behalf of this process
+/// (Linux `/proc/self/io`), or `None` if the counter is unavailable.
+fn device_write_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/io").ok()?;
+    s.lines()
+        .find_map(|line| line.strip_prefix("write_bytes:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
 /// Copy `src` to `dst` with progress, cancellation and bandwidth limiting.
 ///
 /// Returns the number of bytes written.
+///
+/// Progress semantics: the per-chunk callback reports *honest* progress —
+/// the page-cache writes clamped to how much the kernel has actually landed
+/// on the device (`/proc/self/io`, see [`DevioTracker`]), and the flush-
+/// tick callback keeps reporting that watermark while the final `fsync`
+/// blocks. The caller's final report is what closes a bar at 100%, which
+/// happens only after `fsync` succeeded. Without the counter (non-Linux,
+/// or `PSYNC_PROGRESS_NO_DEVIO=1`) the callback sees the page-cache
+/// progress, as before.
 pub fn copy_file(src: &Path, dst: &Path, ctx: &CopyCtx, pacer: &Option<std::sync::Mutex<Pacer>>) -> Result<u64> {
     let mut in_file = File::open(src)
         .map_err(|e| AppError::io(format!("opening source '{src}'", src = src.display()), e))?;
@@ -247,6 +347,7 @@ pub fn copy_file(src: &Path, dst: &Path, ctx: &CopyCtx, pacer: &Option<std::sync
     let total = ctx.src_meta.len();
     let mut buf = vec![0u8; COPY_BUFFER];
     let mut done: u64 = 0;
+    let mut devio = DevioTracker::new();
 
     loop {
         if crate::cancel::is_cancelled() {
@@ -271,7 +372,13 @@ pub fn copy_file(src: &Path, dst: &Path, ctx: &CopyCtx, pacer: &Option<std::sync
         }
         done += n as u64;
         if done < total {
-            if !(ctx.on_chunk)(done) {
+            let reported = if let Some(d) = devio.as_mut() {
+                d.observe(device_write_bytes());
+                d.honest(done)
+            } else {
+                done
+            };
+            if !(ctx.on_chunk)(reported) {
                 ctx.cleanup(dst);
                 return Err(AppError::Cancelled);
             }
@@ -279,9 +386,12 @@ pub fn copy_file(src: &Path, dst: &Path, ctx: &CopyCtx, pacer: &Option<std::sync
     }
 
     // --- preserve metadata + flush to the device ---------------------------
-    finalize_copy(dst, &|| out_file.sync_all(), ctx)?;
+    finalize_copy(dst, &|| out_file.sync_all(), ctx, devio.as_ref(), total)?;
     Ok(done)
 }
+
+/// How often the flush-tick thread polls the device-side watermark.
+const FLUSH_TICK_INTERVAL: Duration = Duration::from_millis(150);
 
 /// Finalize a finished copy: preserve metadata, then flush the data to
 /// stable storage.
@@ -291,7 +401,19 @@ pub fn copy_file(src: &Path, dst: &Path, ctx: &CopyCtx, pacer: &Option<std::sync
 /// lie (a failed backup is worse than a known-bad one). The partial
 /// destination is cleaned up exactly like any other mid-copy failure —
 /// kept only under `keep_partial` (`-P`), same as a failed write.
-fn finalize_copy(dst: &Path, sync: &dyn Fn() -> std::io::Result<()>, ctx: &CopyCtx) -> Result<()> {
+///
+/// While the (blocking) flush runs, a helper thread polls the device-side
+/// watermark (`devio`) and feeds it through `ctx.on_flush_tick`, so the
+/// progress bar crawls to 100% at the real flush speed instead of freezing
+/// — and the bar only lands at 100% once `fsync` itself has succeeded
+/// (the caller's final report).
+fn finalize_copy(
+    dst: &Path,
+    sync: &dyn Fn() -> std::io::Result<()>,
+    ctx: &CopyCtx,
+    devio: Option<&DevioTracker>,
+    size: u64,
+) -> Result<()> {
     if ctx.preserve_perms {
         let _ = fs::set_permissions(dst, ctx.src_meta.permissions());
     }
@@ -306,14 +428,50 @@ fn finalize_copy(dst: &Path, sync: &dyn Fn() -> std::io::Result<()>, ctx: &CopyC
             let _ = fs::set_times(dst, t);
         }
     }
-    if let Err(e) = sync() {
+
+    // Tick the bar while the flush blocks: the watermark only advances as
+    // the kernel lands data on the device, so this is an honest crawl.
+    let mut tick_stop: Option<Arc<AtomicBool>> = None;
+    let mut tick_thread: Option<thread::JoinHandle<()>> = None;
+    if let (Some(d), Some(hook)) = (devio, ctx.on_flush_tick.as_ref()) {
+        let hook = Arc::clone(hook);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let base = d.base;
+        let handle = thread::spawn(move || loop {
+            if stop_flag.load(Ordering::Relaxed) || crate::cancel::is_cancelled() {
+                break;
+            }
+            thread::sleep(FLUSH_TICK_INTERVAL);
+            if stop_flag.load(Ordering::Relaxed) || crate::cancel::is_cancelled() {
+                break;
+            }
+            if let Some(cur) = device_write_bytes() {
+                if !hook(cur.saturating_sub(base).min(size)) {
+                    break;
+                }
+            }
+        });
+        tick_stop = Some(stop);
+        tick_thread = Some(handle);
+    }
+
+    let res = sync();
+
+    if let Some(stop) = &tick_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(handle) = tick_thread {
+        let _ = handle.join();
+    }
+
+    res.map_err(|e| {
         ctx.cleanup(dst);
-        return Err(AppError::io(
+        AppError::io(
             format!("fsync of '{}' (flushing data to the device)", dst.display()),
             e,
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 /// Best-effort `chown` of a path (only takes effect as root / with
@@ -392,7 +550,8 @@ mod tests {
             preserve_owner: None,
             src_meta: fs::metadata(&src).unwrap(),
             keep_partial,
-            on_chunk: Box::new(|_| true),
+            on_chunk: Arc::new(|_| true),
+            on_flush_tick: None,
         };
         (src, dst, ctx)
     }
@@ -410,7 +569,7 @@ mod tests {
     #[test]
     fn fsync_failure_is_reported_and_partial_removed() {
         let (_src, dst, ctx) = setup("fsync-fail", false);
-        let err = finalize_copy(&dst, &simulated_disk_failure, &ctx).unwrap_err();
+        let err = finalize_copy(&dst, &simulated_disk_failure, &ctx, None, 0).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("fsync"), "error must name the failed flush: {msg}");
         assert!(!dst.exists(), "partial destination must be removed after failed fsync");
@@ -421,7 +580,7 @@ mod tests {
     #[test]
     fn fsync_failure_with_keep_partial_keeps_the_file() {
         let (_src, dst, ctx) = setup("fsync-fail-p", true);
-        let err = finalize_copy(&dst, &simulated_disk_failure, &ctx).unwrap_err();
+        let err = finalize_copy(&dst, &simulated_disk_failure, &ctx, None, 0).unwrap_err();
         assert!(err.to_string().contains("fsync"));
         assert!(dst.exists(), "keep_partial must preserve the file");
     }
@@ -430,7 +589,7 @@ mod tests {
     #[test]
     fn fsync_success_finalizes_cleanly() {
         let (_src, dst, ctx) = setup("fsync-ok", false);
-        finalize_copy(&dst, &|| Ok(()), &ctx).unwrap();
+        finalize_copy(&dst, &|| Ok(()), &ctx, None, 0).unwrap();
         assert!(dst.exists());
     }
 
@@ -469,7 +628,8 @@ mod tests {
             preserve_owner: None,
             src_meta: fs::metadata(&src).unwrap(),
             keep_partial: false,
-            on_chunk: Box::new(|_| true),
+            on_chunk: Arc::new(|_| true),
+            on_flush_tick: None,
         };
         let pacer: Option<std::sync::Mutex<Pacer>> = None;
         let done = copy_file(&src, &dst, &ctx, &pacer).unwrap();
@@ -485,5 +645,87 @@ mod tests {
             fs::metadata(&src).unwrap().permissions(),
             "permissions must be preserved"
         );
+    }
+
+    /// The watermark clamps progress to what is actually on the device,
+    /// never regresses, and passes through once caught up (or when the
+    /// reported progress is below the watermark).
+    #[test]
+    fn devio_watermark_clamps_and_is_monotonic() {
+        let mut t = DevioTracker { base: 1000, watermark: 0, disabled: false };
+        t.observe(Some(1060)); // 60 bytes landed on the device
+        assert_eq!(t.honest(100), 60);
+        t.observe(Some(1040)); // counter regression: watermark keeps its max
+        assert_eq!(t.honest(100), 60);
+        t.observe(None); // unreadable counter: unchanged
+        assert_eq!(t.honest(100), 60);
+        t.observe(Some(1100)); // device caught up
+        assert_eq!(t.honest(100), 100);
+        assert_eq!(t.honest(80), 80); // below the watermark: raw value
+    }
+
+    /// A counter frozen at 0 (no io accounting / device never accepted a
+    /// byte) must not freeze the bar at 0%: after the grace period, report
+    /// page-cache progress.
+    #[test]
+    fn devio_frozen_counter_falls_back_after_grace() {
+        let mut t = DevioTracker { base: 0, watermark: 0, disabled: false };
+        t.observe(Some(0));
+        assert_eq!(t.honest(DEVIO_FALLBACK_AFTER - 1), 0);
+        assert_eq!(t.honest(DEVIO_FALLBACK_AFTER), DEVIO_FALLBACK_AFTER);
+        assert!(t.disabled);
+        assert_eq!(t.honest(DEVIO_FALLBACK_AFTER + 5), DEVIO_FALLBACK_AFTER + 5);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_write_bytes_counter_readable() {
+        assert!(device_write_bytes().is_some());
+    }
+
+    /// While the (slow) flush blocks, the flush-tick hook must still be
+    /// fed — this is what keeps the bar crawling toward 100% at real flush
+    /// speed — and it must stop once the flush returns.
+    #[test]
+    fn flush_tick_fires_during_slow_sync() {
+        let dir = scratch("flush-tick");
+        let src = dir.join("in.bin");
+        let dst = dir.join("out.bin");
+        fs::write(&src, [0u8; 4096]).unwrap();
+        fs::write(&dst, [0u8; 4096]).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_w = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (c2, l2) = (calls.clone(), last_w.clone());
+        let hook: ChunkHook = Arc::new(move |w: u64| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            l2.store(w, std::sync::atomic::Ordering::Relaxed);
+            true
+        });
+        let ctx = CopyCtx {
+            preserve_perms: false,
+            preserve_time: false,
+            preserve_owner: None,
+            src_meta: fs::metadata(&src).unwrap(),
+            keep_partial: false,
+            on_chunk: Arc::new(|_| true),
+            on_flush_tick: Some(hook),
+        };
+        // Longer than one tick interval, so at least one tick is guaranteed
+        // while the flush is in flight.
+        let slow = || {
+            thread::sleep(FLUSH_TICK_INTERVAL * 3);
+            Ok(())
+        };
+        let devio = DevioTracker { base: 0, watermark: 100, disabled: false };
+        finalize_copy(&dst, &slow, &ctx, Some(&devio), 4096).unwrap();
+        assert!(
+            calls.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the flush-tick hook must fire while the flush blocks"
+        );
+        assert!(
+            last_w.load(std::sync::atomic::Ordering::Relaxed) <= 4096,
+            "ticked values must stay within the file size"
+        );
+        assert!(dst.exists());
     }
 }
