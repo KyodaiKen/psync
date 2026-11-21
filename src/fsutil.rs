@@ -278,7 +278,20 @@ pub fn copy_file(src: &Path, dst: &Path, ctx: &CopyCtx, pacer: &Option<std::sync
         }
     }
 
-    // --- preserve metadata -------------------------------------------------
+    // --- preserve metadata + flush to the device ---------------------------
+    finalize_copy(dst, &|| out_file.sync_all(), ctx)?;
+    Ok(done)
+}
+
+/// Finalize a finished copy: preserve metadata, then flush the data to
+/// stable storage.
+///
+/// A failed flush is a **hard failure**: until `fsync` succeeds the data
+/// is only as durable as the page cache, so reporting success would be a
+/// lie (a failed backup is worse than a known-bad one). The partial
+/// destination is cleaned up exactly like any other mid-copy failure —
+/// kept only under `keep_partial` (`-P`), same as a failed write.
+fn finalize_copy(dst: &Path, sync: &dyn Fn() -> std::io::Result<()>, ctx: &CopyCtx) -> Result<()> {
     if ctx.preserve_perms {
         let _ = fs::set_permissions(dst, ctx.src_meta.permissions());
     }
@@ -293,8 +306,14 @@ pub fn copy_file(src: &Path, dst: &Path, ctx: &CopyCtx, pacer: &Option<std::sync
             let _ = fs::set_times(dst, t);
         }
     }
-    let _ = out_file.sync_all();
-    Ok(done)
+    if let Err(e) = sync() {
+        ctx.cleanup(dst);
+        return Err(AppError::io(
+            format!("fsync of '{}' (flushing data to the device)", dst.display()),
+            e,
+        ));
+    }
+    Ok(())
 }
 
 /// Best-effort `chown` of a path (only takes effect as root / with
@@ -339,4 +358,132 @@ pub fn shorten_path(path: &str, max_len: usize) -> String {
     let head: String = chars[..half].iter().collect();
     let tail: String = chars[chars.len() - half..].iter().collect();
     format!("{head}\u{2026}{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "psync-fsutil-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Real src/dst pair plus a `CopyCtx` with the requested `keep_partial`
+    /// and an in-flight (partial) destination file already present.
+    fn setup(tag: &str, keep_partial: bool) -> (PathBuf, PathBuf, CopyCtx) {
+        let dir = scratch(tag);
+        let src = dir.join("in.bin");
+        let dst = dir.join("out.bin");
+        let payload: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+        fs::write(&dst, b"partial-so-far").unwrap();
+        let ctx = CopyCtx {
+            preserve_perms: true,
+            preserve_time: true,
+            preserve_owner: None,
+            src_meta: fs::metadata(&src).unwrap(),
+            keep_partial,
+            on_chunk: Box::new(|_| true),
+        };
+        (src, dst, ctx)
+    }
+
+    fn simulated_disk_failure() -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "simulated device failure",
+        ))
+    }
+
+    /// A failed fsync must surface as a copy error — reporting success here
+    /// would mean "data may not be on the device" — and the partial
+    /// destination must be removed just like after a failed write.
+    #[test]
+    fn fsync_failure_is_reported_and_partial_removed() {
+        let (_src, dst, ctx) = setup("fsync-fail", false);
+        let err = finalize_copy(&dst, &simulated_disk_failure, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fsync"), "error must name the failed flush: {msg}");
+        assert!(!dst.exists(), "partial destination must be removed after failed fsync");
+    }
+
+    /// With `-P` the partial destination survives a failed flush, so the
+    /// user can inspect it.
+    #[test]
+    fn fsync_failure_with_keep_partial_keeps_the_file() {
+        let (_src, dst, ctx) = setup("fsync-fail-p", true);
+        let err = finalize_copy(&dst, &simulated_disk_failure, &ctx).unwrap_err();
+        assert!(err.to_string().contains("fsync"));
+        assert!(dst.exists(), "keep_partial must preserve the file");
+    }
+
+    /// A successful flush leaves the destination in place.
+    #[test]
+    fn fsync_success_finalizes_cleanly() {
+        let (_src, dst, ctx) = setup("fsync-ok", false);
+        finalize_copy(&dst, &|| Ok(()), &ctx).unwrap();
+        assert!(dst.exists());
+    }
+
+    /// The cleanup contract every failure path (write error, cancel, failed
+    /// flush) relies on.
+    #[test]
+    fn cleanup_removes_partial_unless_keep_partial() {
+        let (_src, dst_rm, ctx_rm) = setup("cleanup-rm", false);
+        ctx_rm.cleanup(&dst_rm);
+        assert!(!dst_rm.exists());
+
+        let (_src, dst_keep, ctx_keep) = setup("cleanup-keep", true);
+        ctx_keep.cleanup(&dst_keep);
+        assert!(dst_keep.exists());
+    }
+
+    /// End to end: a successful copy stays byte-identical and keeps the
+    /// source's mtime + permissions (pins the refactored finalize tail).
+    #[test]
+    fn copy_file_success_is_byte_identical_with_metadata() {
+        let dir = scratch("e2e");
+        let src = dir.join("in.bin");
+        let dst = dir.join("out.bin");
+        let payload: Vec<u8> = (0..1024u32).map(|i| (i * 7 % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+        let t = std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_767_261_600),
+        );
+        fs::set_times(&src, t).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let ctx = CopyCtx {
+            preserve_perms: true,
+            preserve_time: true,
+            preserve_owner: None,
+            src_meta: fs::metadata(&src).unwrap(),
+            keep_partial: false,
+            on_chunk: Box::new(|_| true),
+        };
+        let pacer: Option<std::sync::Mutex<Pacer>> = None;
+        let done = copy_file(&src, &dst, &ctx, &pacer).unwrap();
+        assert_eq!(done, payload.len() as u64);
+        assert_eq!(fs::read(&dst).unwrap(), payload);
+        assert_eq!(
+            fs::metadata(&dst).unwrap().modified().unwrap(),
+            fs::metadata(&src).unwrap().modified().unwrap(),
+            "mtime must be preserved"
+        );
+        assert_eq!(
+            fs::metadata(&dst).unwrap().permissions(),
+            fs::metadata(&src).unwrap().permissions(),
+            "permissions must be preserved"
+        );
+    }
 }
